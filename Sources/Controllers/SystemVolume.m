@@ -18,6 +18,29 @@
 // no controllable volume. MUST be 0 in shipping builds.
 #define FAKE_NO_CONTROLLABLE_VOLUME 0
 
+// Debug aid: set to 1 to force the master-volume check to report NO, so the
+// per-channel kAudioDevicePropertyVolumeScalar fallback is exercised instead of
+// the master path.
+//
+// To actually reach (and control the volume through) this fallback you must test
+// with an output device that offers per-channel volume controls, such as Apple
+// AirPods. The Apple MacBook built-in speakers only expose a master control and
+// no per-channel controls, so disabling the master here leaves no way to control
+// their volume: hasControllableVolume then correctly reports NO and the code
+// takes the "no output controls" path instead of the per-channel fallback.
+//
+// MUST be 0 in shipping builds.
+#define FAKE_NO_MASTER_VOLUME 0
+
+@interface SystemApplication ()
+// YES if the device exposes a single master output volume element (subject to
+// the FAKE_NO_MASTER_VOLUME override).
+- (BOOL)hasMasterVolumeForDevice:(AudioDeviceID)deviceID;
+// Fills channels[0]/channels[1] with the device's preferred stereo output
+// channel numbers. Returns YES on success. channels must point to 2 UInt32s.
+- (BOOL)getStereoOutputChannels:(UInt32 *)channels forDevice:(AudioDeviceID)deviceID;
+@end
+
 @implementation SystemApplication
 
 @synthesize currentVolume = _currentVolume;
@@ -46,15 +69,41 @@
 	return defaultOutputDeviceID;
 }
 
-- (void)setCurrentVolume:(double)currentVolume
+- (BOOL)hasMasterVolumeForDevice:(AudioDeviceID)deviceID
 {
-	AudioDeviceID defaultOutputDeviceID = [self getDefaultOutputDevice];
-
-	AudioObjectPropertyAddress volumePropertyAddress = {
+#if FAKE_NO_MASTER_VOLUME
+	return NO;
+#else
+	AudioObjectPropertyAddress masterVolumeAddress = {
 		kAudioHardwareServiceDeviceProperty_VirtualMainVolume,
 		kAudioDevicePropertyScopeOutput,
 		kAudioObjectPropertyElementMain
 	};
+
+	return AudioObjectHasProperty(deviceID, &masterVolumeAddress) ? YES : NO;
+#endif
+}
+
+- (BOOL)getStereoOutputChannels:(UInt32 *)channels forDevice:(AudioDeviceID)deviceID
+{
+	AudioObjectPropertyAddress stereoChannelsAddress = {
+		kAudioDevicePropertyPreferredChannelsForStereo,
+		kAudioDevicePropertyScopeOutput,
+		kAudioObjectPropertyElementMain
+	};
+
+	UInt32 dataSize = sizeof(UInt32) * 2;
+	OSStatus result = AudioObjectGetPropertyData(deviceID,
+												 &stereoChannelsAddress,
+												 0, NULL,
+												 &dataSize, channels);
+
+	return result == kAudioHardwareNoError;
+}
+
+- (void)setCurrentVolume:(double)currentVolume
+{
+	AudioDeviceID defaultOutputDeviceID = [self getDefaultOutputDevice];
 
 	AudioObjectPropertyAddress mutePropertyAddress = {
 		kAudioDevicePropertyMute,
@@ -84,14 +133,50 @@
 								   dataSize, &mute);
 	}
 
-	// Set the volume to the requested level (including 0).
 	dataSize = sizeof(volume);
-	OSStatus result = AudioObjectSetPropertyData(defaultOutputDeviceID,
-												 &volumePropertyAddress,
-												 0, NULL,
-												 dataSize, &volume);
-	if (result != noErr) {
-		NSLog(@"Failed to set volume for device 0x%0x", defaultOutputDeviceID);
+
+	if ([self hasMasterVolumeForDevice:defaultOutputDeviceID]) {
+		// Preferred path: set the single master volume element.
+		AudioObjectPropertyAddress masterVolumeAddress = {
+			kAudioHardwareServiceDeviceProperty_VirtualMainVolume,
+			kAudioDevicePropertyScopeOutput,
+			kAudioObjectPropertyElementMain
+		};
+
+		OSStatus result = AudioObjectSetPropertyData(defaultOutputDeviceID,
+													 &masterVolumeAddress,
+													 0, NULL,
+													 dataSize, &volume);
+		if (result != noErr) {
+			NSLog(@"Failed to set master volume for device 0x%0x", defaultOutputDeviceID);
+		}
+	} else {
+		// Fallback: the device has no master element, so set each output
+		// channel's volume individually (as macOS itself does).
+		UInt32 channels[2];
+		if ([self getStereoOutputChannels:channels forDevice:defaultOutputDeviceID]) {
+			for (int i = 0; i < 2; i++) {
+				AudioObjectPropertyAddress channelVolumeAddress = {
+					kAudioDevicePropertyVolumeScalar,
+					kAudioDevicePropertyScopeOutput,
+					channels[i]
+				};
+
+				if (!AudioObjectHasProperty(defaultOutputDeviceID, &channelVolumeAddress)) {
+					continue;
+				}
+
+				OSStatus result = AudioObjectSetPropertyData(defaultOutputDeviceID,
+															 &channelVolumeAddress,
+															 0, NULL,
+															 dataSize, &volume);
+				if (result != noErr) {
+					NSLog(@"Failed to set volume for channel %u of device 0x%0x", channels[i], defaultOutputDeviceID);
+				}
+			}
+		} else {
+			NSLog(@"No controllable volume (master or per-channel) for device 0x%0x", defaultOutputDeviceID);
+		}
 	}
 }
 
@@ -135,13 +220,28 @@
 		return NO;
 	}
 
-	AudioObjectPropertyAddress volumePropertyAddress = {
-		kAudioHardwareServiceDeviceProperty_VirtualMainVolume,
-		kAudioDevicePropertyScopeOutput,
-		kAudioObjectPropertyElementMain
-	};
+	// Controllable if the device has a master volume element ...
+	if ([self hasMasterVolumeForDevice:defaultOutputDeviceID]) {
+		return YES;
+	}
 
-	return AudioObjectHasProperty(defaultOutputDeviceID, &volumePropertyAddress) ? YES : NO;
+	// ... or at least one output channel exposes a per-channel volume scalar.
+	UInt32 channels[2];
+	if ([self getStereoOutputChannels:channels forDevice:defaultOutputDeviceID]) {
+		for (int i = 0; i < 2; i++) {
+			AudioObjectPropertyAddress channelVolumeAddress = {
+				kAudioDevicePropertyVolumeScalar,
+				kAudioDevicePropertyScopeOutput,
+				channels[i]
+			};
+
+			if (AudioObjectHasProperty(defaultOutputDeviceID, &channelVolumeAddress)) {
+				return YES;
+			}
+		}
+	}
+
+	return NO;
 #endif
 }
 
@@ -167,22 +267,60 @@
 		return 0.0; // Treat mute as 0%
 	}
 
-	// Otherwise, get the real volume
-	AudioObjectPropertyAddress volumePropertyAddress = {
-		kAudioHardwareServiceDeviceProperty_VirtualMainVolume,
-		kAudioDevicePropertyScopeOutput,
-		kAudioObjectPropertyElementMain
-	};
-
 	Float32 volume = 0;
-	UInt32 volumedataSize = sizeof(volume);
-	OSStatus result = AudioObjectGetPropertyData(defaultOutputDeviceID,
-												 &volumePropertyAddress,
-												 0, NULL,
-												 &volumedataSize, &volume);
 
-	if (result != kAudioHardwareNoError) {
-		NSLog(@"No volume reported for device 0x%0x", defaultOutputDeviceID);
+	if ([self hasMasterVolumeForDevice:defaultOutputDeviceID]) {
+		// Preferred path: read the single master volume element.
+		AudioObjectPropertyAddress masterVolumeAddress = {
+			kAudioHardwareServiceDeviceProperty_VirtualMainVolume,
+			kAudioDevicePropertyScopeOutput,
+			kAudioObjectPropertyElementMain
+		};
+
+		UInt32 volumedataSize = sizeof(volume);
+		OSStatus result = AudioObjectGetPropertyData(defaultOutputDeviceID,
+													 &masterVolumeAddress,
+													 0, NULL,
+													 &volumedataSize, &volume);
+
+		if (result != kAudioHardwareNoError) {
+			NSLog(@"No master volume reported for device 0x%0x", defaultOutputDeviceID);
+		}
+	} else {
+		// Fallback: no master element, so average the per-channel volumes (as
+		// macOS itself does when synthesizing a master level).
+		UInt32 channels[2];
+		if ([self getStereoOutputChannels:channels forDevice:defaultOutputDeviceID]) {
+			Float32 sum = 0;
+			int count = 0;
+			for (int i = 0; i < 2; i++) {
+				AudioObjectPropertyAddress channelVolumeAddress = {
+					kAudioDevicePropertyVolumeScalar,
+					kAudioDevicePropertyScopeOutput,
+					channels[i]
+				};
+
+				if (!AudioObjectHasProperty(defaultOutputDeviceID, &channelVolumeAddress)) {
+					continue;
+				}
+
+				Float32 channelVolume = 0;
+				UInt32 volumedataSize = sizeof(channelVolume);
+				if (AudioObjectGetPropertyData(defaultOutputDeviceID,
+											   &channelVolumeAddress,
+											   0, NULL,
+											   &volumedataSize, &channelVolume) == kAudioHardwareNoError) {
+					sum += channelVolume;
+					count++;
+				}
+			}
+
+			if (count > 0) {
+				volume = sum / (Float32)count;
+			}
+		} else {
+			NSLog(@"No volume reported for device 0x%0x", defaultOutputDeviceID);
+		}
 	}
 
 	return ((double)volume) * 100.0;
