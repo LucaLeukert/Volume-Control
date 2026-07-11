@@ -361,6 +361,130 @@
 }
 
 
+#pragma mark - Diagnostics
+
+// Raw, un-faked helpers used only by the diagnostics report. They deliberately
+// query the hardware directly (no FAKE_* overrides) so the report reflects the
+// device's real capabilities.
+
+static NSString *VCDeviceName(AudioObjectID dev)
+{
+	CFStringRef name = NULL;
+	UInt32 size = sizeof(name);
+	AudioObjectPropertyAddress addr = {
+		kAudioObjectPropertyName,
+		kAudioObjectPropertyScopeGlobal,
+		kAudioObjectPropertyElementMain
+	};
+	if (AudioObjectGetPropertyData(dev, &addr, 0, NULL, &size, &name) == noErr && name) {
+		return (__bridge_transfer NSString *)name;
+	}
+	return @"(unknown)";
+}
+
+static UInt32 VCOutputChannelCount(AudioObjectID dev)
+{
+	AudioObjectPropertyAddress addr = {
+		kAudioDevicePropertyStreamConfiguration,
+		kAudioDevicePropertyScopeOutput,
+		kAudioObjectPropertyElementMain
+	};
+	UInt32 size = 0;
+	if (AudioObjectGetPropertyDataSize(dev, &addr, 0, NULL, &size) != noErr || size == 0) {
+		return 0;
+	}
+	AudioBufferList *list = malloc(size);
+	UInt32 count = 0;
+	if (AudioObjectGetPropertyData(dev, &addr, 0, NULL, &size, list) == noErr) {
+		for (UInt32 i = 0; i < list->mNumberBuffers; i++) {
+			count += list->mBuffers[i].mNumberChannels;
+		}
+	}
+	free(list);
+	return count;
+}
+
+static BOOL VCHasOutputProperty(AudioObjectID dev, AudioObjectPropertySelector selector, UInt32 element)
+{
+	AudioObjectPropertyAddress addr = { selector, kAudioDevicePropertyScopeOutput, element };
+	return AudioObjectHasProperty(dev, &addr) ? YES : NO;
+}
+
+static NSString *VCYesNo(BOOL value)
+{
+	return value ? @"yes" : @"no";
+}
+
++ (NSString *)outputDevicesDiagnostics
+{
+	AudioObjectPropertyAddress devicesAddr = {
+		kAudioHardwarePropertyDevices,
+		kAudioObjectPropertyScopeGlobal,
+		kAudioObjectPropertyElementMain
+	};
+
+	UInt32 size = 0;
+	if (AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &devicesAddr, 0, NULL, &size) != noErr || size == 0) {
+		return @"(could not enumerate audio devices)\n";
+	}
+
+	UInt32 count = size / sizeof(AudioObjectID);
+	AudioObjectID *devices = malloc(size);
+	if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &devicesAddr, 0, NULL, &size, devices) != noErr) {
+		free(devices);
+		return @"(could not enumerate audio devices)\n";
+	}
+
+	// Current default output device, to flag it in the listing.
+	AudioObjectPropertyAddress defAddr = {
+		kAudioHardwarePropertyDefaultOutputDevice,
+		kAudioObjectPropertyScopeGlobal,
+		kAudioObjectPropertyElementMain
+	};
+	AudioObjectID defaultDev = kAudioObjectUnknown;
+	UInt32 defSize = sizeof(defaultDev);
+	AudioObjectGetPropertyData(kAudioObjectSystemObject, &defAddr, 0, NULL, &defSize, &defaultDev);
+
+	NSMutableString *out = [NSMutableString string];
+
+	for (UInt32 i = 0; i < count; i++) {
+		AudioObjectID dev = devices[i];
+		if (VCOutputChannelCount(dev) == 0) {
+			continue; // not an output device
+		}
+
+		BOOL master = VCHasOutputProperty(dev, kAudioHardwareServiceDeviceProperty_VirtualMainVolume, kAudioObjectPropertyElementMain);
+		BOOL masterScalar = VCHasOutputProperty(dev, kAudioDevicePropertyVolumeScalar, kAudioObjectPropertyElementMain);
+		BOOL mute = VCHasOutputProperty(dev, kAudioDevicePropertyMute, kAudioObjectPropertyElementMain);
+
+		// Preferred stereo channels and whether each carries a volume scalar.
+		BOOL leftCh = NO, rightCh = NO;
+		AudioObjectPropertyAddress stereoAddr = {
+			kAudioDevicePropertyPreferredChannelsForStereo,
+			kAudioDevicePropertyScopeOutput,
+			kAudioObjectPropertyElementMain
+		};
+		UInt32 channels[2] = {0, 0};
+		UInt32 channelsSize = sizeof(channels);
+		if (AudioObjectGetPropertyData(dev, &stereoAddr, 0, NULL, &channelsSize, channels) == noErr) {
+			leftCh = VCHasOutputProperty(dev, kAudioDevicePropertyVolumeScalar, channels[0]);
+			rightCh = VCHasOutputProperty(dev, kAudioDevicePropertyVolumeScalar, channels[1]);
+		}
+
+		BOOL controllable = master || leftCh || rightCh;
+
+		[out appendFormat:@"%@%@\n", (dev == defaultDev) ? @"[DEFAULT] " : @"", VCDeviceName(dev)];
+		[out appendFormat:@"  master VirtualMainVolume : %@\n", VCYesNo(master)];
+		[out appendFormat:@"  master VolumeScalar      : %@\n", VCYesNo(masterScalar)];
+		[out appendFormat:@"  per-channel L / R        : %@ / %@\n", VCYesNo(leftCh), VCYesNo(rightCh)];
+		[out appendFormat:@"  mute                     : %@\n", VCYesNo(mute)];
+		[out appendFormat:@"  -> Volume Control can control this device: %@\n\n", controllable ? @"YES" : @"NO"];
+	}
+
+	free(devices);
+	return out;
+}
+
 -(void)dealloc
 {
 }

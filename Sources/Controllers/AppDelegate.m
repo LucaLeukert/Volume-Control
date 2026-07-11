@@ -15,6 +15,8 @@
 #import <IOKit/hidsystem/ev_keymap.h>
 #import <ServiceManagement/ServiceManagement.h>
 #import <stdatomic.h>
+#import <CoreServices/CoreServices.h>
+#import <sys/sysctl.h>
 
 #import "OSD.h"
 
@@ -1320,6 +1322,145 @@ static NSTimeInterval updateSystemVolumeInterval=0.1f;
     
     [[NSApplication sharedApplication] activateIgnoringOtherApps:YES];
     [[NSApplication sharedApplication] orderFrontStandardAboutPanelWithOptions:options];
+}
+
+#pragma mark - Diagnostics
+
+static NSString * const kGitHubIssuesURL = @"https://github.com/alberti42/Volume-Control/issues";
+
+// hw.model, e.g. "MacBookPro18,3".
+- (NSString *)hardwareModel
+{
+    size_t len = 0;
+    if (sysctlbyname("hw.model", NULL, &len, NULL, 0) != 0 || len == 0) {
+        return @"(unknown)";
+    }
+    char *buf = malloc(len);
+    NSString *model = @"(unknown)";
+    if (sysctlbyname("hw.model", buf, &len, NULL, 0) == 0) {
+        model = [NSString stringWithUTF8String:buf] ?: @"(unknown)";
+    }
+    free(buf);
+    return model;
+}
+
+// Automation (Apple Events) permission for a target app, without prompting.
+- (NSString *)automationStatusForBundleID:(NSString *)bundleID
+{
+    const char *cstr = [bundleID UTF8String];
+    AEAddressDesc target;
+    if (AECreateDesc(typeApplicationBundleID, cstr, strlen(cstr), &target) != noErr) {
+        return @"(check failed)";
+    }
+
+    OSStatus status = AEDeterminePermissionToAutomateTarget(&target, typeWildCard, typeWildCard, false);
+    AEDisposeDesc(&target);
+
+    switch (status) {
+        case noErr:                             return @"granted";
+        case errAEEventNotPermitted:            return @"denied";
+        case errAEEventWouldRequireUserConsent: return @"not yet requested";
+        case procNotFound:                      return @"app not running";
+        default:                                return [NSString stringWithFormat:@"unknown (%d)", (int)status];
+    }
+}
+
+// Builds the self-documenting plain-text diagnostics report placed on the
+// clipboard. Sections are labelled and commented so the user can read it and
+// remove anything they prefer not to share before posting.
+- (NSString *)diagnosticsReport
+{
+    NSDictionary *info = [[NSBundle mainBundle] infoDictionary];
+    NSString *shortVersion = info[@"CFBundleShortVersionString"] ?: @"?";
+    NSString *buildNumber  = info[@"CFBundleVersion"] ?: @"?";
+    NSString *osVersion    = [[NSProcessInfo processInfo] operatingSystemVersionString];
+
+    NSMutableString *r = [NSMutableString string];
+    [r appendString:@"# Volume Control — diagnostics\n"];
+    [r appendString:@"# Plain text. Read it and delete any line you prefer not to share before posting.\n\n"];
+
+    [r appendString:@"## Versions\n"];
+    [r appendFormat:@"Volume Control : %@ (build %@)\n", shortVersion, buildNumber];
+    [r appendFormat:@"macOS          : %@\n", osVersion];
+    [r appendFormat:@"Mac model      : %@\n\n", [self hardwareModel]];
+
+    [r appendString:@"## Permissions\n"];
+    [r appendFormat:@"Accessibility (intercept volume keys) : %@\n", AXIsProcessTrusted() ? @"granted" : @"NOT granted"];
+    [r appendString:@"Automation (control music players):\n"];
+    [r appendFormat:@"  Apple Music : %@\n", [self automationStatusForBundleID:@"com.apple.Music"]];
+    [r appendFormat:@"  Spotify     : %@\n", [self automationStatusForBundleID:@"com.spotify.client"]];
+    [r appendFormat:@"  Doppler     : %@\n", [self automationStatusForBundleID:@"co.brushedtype.doppler-macos"]];
+    [r appendFormat:@"  Swinsian    : %@\n\n", [self automationStatusForBundleID:@"com.swinsian.Swinsian"]];
+
+    [r appendString:@"## Audio output devices\n"];
+    [r appendString:@"# If a device shows \"no\" everywhere it exposes no software volume control;\n"];
+    [r appendString:@"# its volume must be changed on the device itself. master = one volume;\n"];
+    [r appendString:@"# per-channel = separate left/right controls.\n\n"];
+    [r appendString:[SystemApplication outputDevicesDiagnostics]];
+
+    // Collapse the trailing blank line left by the per-device blocks into a
+    // single newline.
+    while ([r hasSuffix:@"\n"]) {
+        [r deleteCharactersInRange:NSMakeRange(r.length - 1, 1)];
+    }
+    [r appendString:@"\n"];
+
+    return r;
+}
+
+// A selectable text field showing the GitHub issues URL as a clickable link,
+// for use as an NSAlert accessory view.
+- (NSTextField *)diagnosticsLinkField
+{
+    NSTextField *field = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 420, 18)];
+    [field setBezeled:NO];
+    [field setDrawsBackground:NO];
+    [field setEditable:NO];
+    [field setSelectable:YES];
+    [field setAllowsEditingTextAttributes:YES];
+
+    NSMutableAttributedString *attr = [[NSMutableAttributedString alloc] initWithString:kGitHubIssuesURL];
+    NSRange range = NSMakeRange(0, kGitHubIssuesURL.length);
+    [attr addAttribute:NSLinkAttributeName value:kGitHubIssuesURL range:range];
+    [attr addAttribute:NSForegroundColorAttributeName value:[NSColor linkColor] range:range];
+    [attr addAttribute:NSUnderlineStyleAttributeName value:@(NSUnderlineStyleSingle) range:range];
+    [field setAttributedStringValue:attr];
+    [field sizeToFit];
+
+    return field;
+}
+
+- (IBAction)copyDiagnostics:(id)sender
+{
+    [[NSApplication sharedApplication] activateIgnoringOtherApps:YES];
+
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"Copy Diagnostics";
+    alert.informativeText = @"Volume Control will copy a diagnostics report to your clipboard, "
+                            @"replacing its current contents.\n\n"
+                            @"Nothing is sent over the Internet — it is plain text you can read and "
+                            @"edit before sharing, for example when opening a GitHub issue:";
+    alert.accessoryView = [self diagnosticsLinkField];
+    [alert addButtonWithTitle:@"Copy to Clipboard"]; // NSAlertFirstButtonReturn (default)
+    [alert addButtonWithTitle:@"Cancel"];
+
+    if ([alert runModal] != NSAlertFirstButtonReturn) {
+        return;
+    }
+
+    NSPasteboard *pasteboard = [NSPasteboard generalPasteboard];
+    [pasteboard clearContents];
+    [pasteboard setString:[self diagnosticsReport] forType:NSPasteboardTypeString];
+
+    NSAlert *done = [[NSAlert alloc] init];
+    done.messageText = @"Diagnostics Copied";
+    done.informativeText = @"The report is on your clipboard. Paste it into your GitHub issue.";
+    [done addButtonWithTitle:@"Visit GitHub Issues Page"]; // NSAlertFirstButtonReturn
+    [done addButtonWithTitle:@"Done"];
+
+    if ([done runModal] == NSAlertFirstButtonReturn) {
+        [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:kGitHubIssuesURL]];
+    }
 }
 
 - (void) receiveWakeNote: (NSNotification*) note

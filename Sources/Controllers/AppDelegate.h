@@ -100,6 +100,7 @@
 - (IBAction)togglePlaySoundFeedback:(id)sender;
 - (IBAction)toggleTapping:(id)sender;
 - (IBAction)aboutPanel:(id)sender;
+- (IBAction)copyDiagnostics:(id)sender;
 - (IBAction)sliderValueChanged:(NSSliderCell*)slider;
 //- (IBAction)showIntroWindow:(id)sender;
 - (IBAction)terminate:(id)sender;
