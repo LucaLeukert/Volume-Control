@@ -6,6 +6,35 @@
         <description>Most recent changes with links to updates.</description>
         <language>en</language>
         <item>
+            <title>2.3.0</title>
+            <pubDate>Sat, 11 Jul 2026 15:18:25 +0000</pubDate>
+            <sparkle:version>248</sparkle:version>
+            <sparkle:shortVersionString>2.3.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>13.5</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/alberti42/Volume-Control/releases/download/v2.3.0/VolumeControl.zip" length="5843125" type="application/octet-stream" sparkle:edSignature="8vSSECkwtEbK3C2rbiTuXs3F1veEoeCy2xEk6rnXfagnfne2R/IPVABD6I6SXe8ILxaB2Urfqyvkaca2V/YuBQ=="/>
+        
+            <description><![CDATA[
+<h2>Better support for displays and devices without a standard volume control</h2>
+<p>This release better handles output devices that don't expose a normal master volume (e.g., USB‑C / DisplayPort / HDMI monitors). It is a response to <a href="https://github.com/alberti42/Volume-Control/issues/53">#53</a>.</p>
+<ul>
+<li><strong>Displays with no software volume control</strong> are now detected correctly. The menu shows the system volume as <strong>(n/a)</strong> instead of a misleading <strong>0%</strong>, the System entry is unchecked, and the volume keys are handed back to macOS for its native handling instead of appearing to do nothing. Both single presses and press‑and‑hold ramping are passed through.</li>
+<li><strong>Devices with per‑channel volume but no master control</strong> (for example AirPods) are now fully controllable — Volume Control adjusts the left and right channels directly, matching what macOS itself does.</li>
+<li>Lowering the system volume to <strong>0%</strong> no longer forces the output device into a muted state that could remain stuck after the volume was raised again.</li>
+</ul>
+<h2>New: Copy Diagnostics</h2>
+<p>A new <strong>Copy Diagnostics</strong> item in the menu gathers a plain‑text report — app and macOS versions, Accessibility/Automation permission status, and the volume controls exposed by every audio output device — and copies it to your clipboard, ready to paste into a bug report. Nothing is sent over the Internet, and you can read and edit the text before sharing.</p>
+<h2>Changes since v2.2.2</h2>
+<ul>
+<li><a href="https://github.com/alberti42/Volume-Control/commit/489725d">489725d</a> Add "Copy Diagnostics" menu item for bug reports</li>
+<li><a href="https://github.com/alberti42/Volume-Control/commit/cdf0b5c">cdf0b5c</a> Add per-channel volume fallback for devices without a master element</li>
+<li><a href="https://github.com/alberti42/Volume-Control/commit/50cbcc6">50cbcc6</a> Uncheck the System menu item when the output has no controllable volume</li>
+<li><a href="https://github.com/alberti42/Volume-Control/commit/2880d34">2880d34</a> Hand volume keys back to macOS when the output has no controllable volume</li>
+<li><a href="https://github.com/alberti42/Volume-Control/commit/92fa2be">92fa2be</a> Don't force device mute when system volume reaches 0%</li>
+</ul>
+<p><strong>Full diff:</strong> https://github.com/alberti42/Volume-Control/compare/v2.2.2...v2.3.0</p>
+            ]]></description>
+        </item>
+        <item>
             <title>2.2.2</title>
             <pubDate>Tue, 21 Apr 2026 13:39:35 +0000</pubDate>
             <sparkle:version>240</sparkle:version>
