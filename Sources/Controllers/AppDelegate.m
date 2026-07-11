@@ -1085,7 +1085,12 @@ static NSTimeInterval updateSystemVolumeInterval=0.1f;
 
 - (void)updateSystemVolume:(NSTimer*)theTimer
 {
-	if(![systemAudio hasControllableVolume])
+	BOOL controllable = [systemAudio hasControllableVolume];
+
+	// Keep the System check mark in sync with availability (see setSystemVolume:).
+	[[self systemBtn] setState:controllable ? NSControlStateValueOn : NSControlStateValueOff];
+
+	if(!controllable)
 		[[self systemPerc] setStringValue:@"(n/a)"];
 	else if([systemAudio isMuted])
 		[[self systemPerc] setStringValue:[NSString stringWithFormat:@"(%d%%)",0]];
@@ -1512,18 +1517,23 @@ static NSTimeInterval updateSystemVolumeInterval=0.1f;
 - (void) setSystemVolume:(NSInteger)volume
 {
 	if (volume == -1)
+	{
 		[[self systemPerc] setHidden:YES];
-	else if (![systemAudio hasControllableVolume])
-	{
-		[[self systemPerc] setHidden:NO];
-		[[self systemPerc] setStringValue:@"(n/a)"];
-	}
-	else
-	{
-		[[self systemPerc] setHidden:NO];
-		[[self systemPerc] setStringValue:[NSString stringWithFormat:@"(%d%%)",(int)volume]];
+		return;
 	}
 
+	BOOL controllable = [systemAudio hasControllableVolume];
+
+	// Reflect availability in the System check mark: unchecked when the output
+	// device exposes no controllable volume, so the menu doesn't imply we can
+	// change a volume we can't. The item stays disabled either way.
+	[[self systemBtn] setState:controllable ? NSControlStateValueOn : NSControlStateValueOff];
+
+	[[self systemPerc] setHidden:NO];
+	if (controllable)
+		[[self systemPerc] setStringValue:[NSString stringWithFormat:@"(%d%%)",(int)volume]];
+	else
+		[[self systemPerc] setStringValue:@"(n/a)"];
 }
 
 - (void) updatePercentages
