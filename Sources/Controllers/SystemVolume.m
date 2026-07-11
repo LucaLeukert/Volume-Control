@@ -58,35 +58,33 @@
 	Float32 volume = (Float32)(currentVolume / 100.);
 	UInt32 dataSize;
 
-	if (volume == 0) {
-		// Mute the device
-		UInt32 mute = 1;
-		dataSize = sizeof(mute);
-		OSStatus result = AudioObjectSetPropertyData(defaultOutputDeviceID,
-													 &mutePropertyAddress,
-													 0, NULL,
-													 dataSize, &mute);
-		if (result != noErr) {
-			NSLog(@"Failed to mute device 0x%0x", defaultOutputDeviceID);
-		}
-	} else {
-		// Set the volume to currentVolume (unmute the device if needed)
+	// Raising the volume above 0 should also clear any active mute, matching
+	// the behavior of the native macOS volume keys. We intentionally do NOT set
+	// the mute flag when the level reaches 0: a scalar of 0 already produces
+	// silence, and muting here would conflate "user lowered the volume to 0%"
+	// with an explicit device mute (handled separately via the mute key). On
+	// hardware that keeps mute and scalar independent, forcing a mute at 0%
+	// could otherwise leave the device stuck muted after the volume is raised
+	// again.
+	if (volume > 0) {
+		// Clear the mute flag in case the device was previously muted, so that
+		// raising the volume actually produces sound again.
 		UInt32 mute = 0;
 		dataSize = sizeof(mute);
 		AudioObjectSetPropertyData(defaultOutputDeviceID,
 								   &mutePropertyAddress,
 								   0, NULL,
 								   dataSize, &mute);
+	}
 
-		// Set the volume
-		dataSize = sizeof(volume);
-		OSStatus result = AudioObjectSetPropertyData(defaultOutputDeviceID,
-													 &volumePropertyAddress,
-													 0, NULL,
-													 dataSize, &volume);
-		if (result != noErr) {
-			NSLog(@"Failed to set volume for device 0x%0x", defaultOutputDeviceID);
-		}
+	// Set the volume to the requested level (including 0).
+	dataSize = sizeof(volume);
+	OSStatus result = AudioObjectSetPropertyData(defaultOutputDeviceID,
+												 &volumePropertyAddress,
+												 0, NULL,
+												 dataSize, &volume);
+	if (result != noErr) {
+		NSLog(@"Failed to set volume for device 0x%0x", defaultOutputDeviceID);
 	}
 }
 
