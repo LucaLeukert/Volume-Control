@@ -11,6 +11,13 @@
 
 #import "SystemVolume.h"
 
+// Debug aid: set to 1 to force -hasControllableVolume to always report NO, so
+// the "no output controls" handling can be exercised on hardware that actually
+// supports software volume control (e.g. the built-in speakers). This simulates
+// the behavior of digital outputs such as HDMI/DisplayPort displays that expose
+// no controllable volume. MUST be 0 in shipping builds.
+#define FAKE_NO_CONTROLLABLE_VOLUME 0
+
 @implementation SystemApplication
 
 @synthesize currentVolume = _currentVolume;
@@ -110,6 +117,32 @@
 	}
 
 	return muteVal;
+}
+
+// Reports whether the current default output device exposes a software-
+// controllable volume. Digital outputs such as HDMI/DisplayPort displays often
+// do not implement a master volume element, in which case macOS itself cannot
+// change their volume and neither can we. Callers use this to present an honest
+// "no output controls" state instead of a misleading 0%.
+- (bool)hasControllableVolume
+{
+#if FAKE_NO_CONTROLLABLE_VOLUME
+	return NO;
+#else
+	AudioDeviceID defaultOutputDeviceID = [self getDefaultOutputDevice];
+
+	if (defaultOutputDeviceID == kAudioObjectUnknown) {
+		return NO;
+	}
+
+	AudioObjectPropertyAddress volumePropertyAddress = {
+		kAudioHardwareServiceDeviceProperty_VirtualMainVolume,
+		kAudioDevicePropertyScopeOutput,
+		kAudioObjectPropertyElementMain
+	};
+
+	return AudioObjectHasProperty(defaultOutputDeviceID, &volumePropertyAddress) ? YES : NO;
+#endif
 }
 
 - (double) currentVolume

@@ -18,6 +18,7 @@
 
 -(id)init;
 -(bool)isMuted;
+-(bool)hasControllableVolume;
 -(NSString *)getDefaultOutputDeviceName;
     
 @property (assign, nonatomic) double currentVolume;  // The sound output volume (0 = minimum, 100 = maximum)

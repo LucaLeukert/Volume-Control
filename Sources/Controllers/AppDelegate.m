@@ -14,6 +14,7 @@
 
 #import <IOKit/hidsystem/ev_keymap.h>
 #import <ServiceManagement/ServiceManagement.h>
+#import <stdatomic.h>
 
 #import "OSD.h"
 
@@ -32,6 +33,23 @@ void handleSIGTERM(int sig) {
 #define HIDE_VOLUME_WINDOW_ID 6
 
 #pragma mark - Tapping key stroke events
+
+// Marks an event as one the tap should let pass through untouched rather than
+// intercept and process. We stamp it onto the system-defined volume keys we
+// re-post ourselves (see -repostSystemDefinedKey:keyDown:) when the active
+// output device exposes no controllable volume and we want macOS to handle the
+// key natively. The tag currently rides in the event's data2 field; real
+// hardware volume-key events carry data2 == -1, so this distinct value cannot
+// collide with them.
+static const NSInteger kPassThroughEventTag = 0x0056434B; // 'VCK'
+
+// Keycode of a volume/mute key we have currently handed off to macOS (or -1 if
+// none). While a key is handed off, the tap lets that key's auto-repeat events
+// and its release flow straight through so macOS ramps natively; without this we
+// would consume every repeat and only single presses would work. Written by the
+// main thread on key-down and cleared by either thread on key-up, so it is
+// accessed atomically across the tap and main threads.
+static _Atomic(int) gPassThroughKeyCode = -1;
 
 CGEventRef event_tap_callback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *refcon)
 {
@@ -87,6 +105,11 @@ CGEventRef event_tap_callback(CGEventTapProxy proxy, CGEventType type, CGEventRe
     NSEvent *sysEvent = [NSEvent eventWithCGEvent:event];
     if ([sysEvent subtype] != NX_SUBTYPE_AUX_CONTROL_BUTTONS) return event;
 
+    // Let our own re-posted volume keys flow straight through to macOS, so it can
+    // perform its native handling. Without this guard we would re-catch and
+    // re-process them, defeating the passthrough (and looping).
+    if ([sysEvent data2] == kPassThroughEventTag) return event;
+
     // Extract key info
     int keyFlags   = ([sysEvent data1] & 0x0000FFFF);
     int keyCode    = (([sysEvent data1] & 0xFFFF0000) >> 16);
@@ -94,11 +117,21 @@ CGEventRef event_tap_callback(CGEventTapProxy proxy, CGEventType type, CGEventRe
     bool keyIsRepeat = (keyFlags & 0x1);
     CGEventFlags keyModifier = [sysEvent modifierFlags] | 0xFFFF;
 
+    // If this key is currently handed off to macOS (because the output device
+    // has no controllable volume), let its auto-repeat events and its release
+    // flow straight through until the key is released, so macOS ramps natively.
+    if (atomic_load(&gPassThroughKeyCode) == keyCode) {
+        if (keyState == 0) { // key up ends the hand-off
+            atomic_store(&gPassThroughKeyCode, -1);
+        }
+        return event;
+    }
+
     // Decide here if it's a volume/mute event
     BOOL isMediaKey = (keyCode == NX_KEYTYPE_MUTE ||
                        keyCode == NX_KEYTYPE_SOUND_UP ||
                        keyCode == NX_KEYTYPE_SOUND_DOWN);
-    
+
     if(isMediaKey /*&& keyModifier==1114111*/) {
         // Hand off all actual logic to main thread
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -147,6 +180,7 @@ CGEventRef event_tap_callback(CGEventTapProxy proxy, CGEventType type, CGEventRe
 - (id)runningPlayer;
 - (void)completeInitialization;
 - (void)setVolumeUp:(bool)increase;
+- (void)repostSystemDefinedKey:(int)keyCode keyDown:(BOOL)keyDown;
 - (void) setItunesVolume:(NSInteger)volume;
 - (void) setSpotifyVolume:(NSInteger)volume;
 - (void) setDopplerVolume:(NSInteger)volume;
@@ -660,7 +694,37 @@ static NSTimeInterval updateSystemVolumeInterval=0.1f;
                                        keyModifier:(CGEventFlags)keyModifier
 {
     [self setAppleCMDModifierPressed:(keyModifier & NX_COMMANDMASK) == NX_COMMANDMASK];
-    
+
+    // If the resolved target is the system output and that device exposes no
+    // controllable volume (e.g. many HDMI/DisplayPort displays), don't handle
+    // the key ourselves and don't show the HUD. Re-post it so macOS performs
+    // its own native handling instead.
+    if (keyCode == NX_KEYTYPE_MUTE ||
+        keyCode == NX_KEYTYPE_SOUND_UP ||
+        keyCode == NX_KEYTYPE_SOUND_DOWN)
+    {
+        if ([self runningPlayer] == systemAudio && ![systemAudio hasControllableVolume])
+        {
+            if (keyState == 1)
+            {
+                // Hand this key off to macOS: re-post the initial press (so a
+                // single tap still registers), then flag it so the tap lets the
+                // auto-repeat events and the release pass straight through until
+                // the key is released, letting macOS ramp natively.
+                atomic_store(&gPassThroughKeyCode, keyCode);
+                [self repostSystemDefinedKey:keyCode keyDown:YES];
+            }
+            else
+            {
+                // Released before the tap saw the flag (fast tap) — clear it and
+                // re-post the release so macOS sees a balanced key event.
+                atomic_store(&gPassThroughKeyCode, -1);
+                [self repostSystemDefinedKey:keyCode keyDown:NO];
+            }
+            return;
+        }
+    }
+
     switch (keyCode) {
         case NX_KEYTYPE_MUTE:
             if (_previousKeyCode != keyCode && self->volumeRampTimer) {
@@ -697,6 +761,27 @@ static NSTimeInterval updateSystemVolumeInterval=0.1f;
             }
             break;
     }
+}
+
+// Re-post a single system-defined volume/mute key so macOS handles it natively.
+// The event is tagged (data2 == kPassThroughEventTag) so our own tap ignores
+// it instead of re-catching it. Down and up are posted separately, mirroring the
+// original events we consumed.
+- (void)repostSystemDefinedKey:(int)keyCode keyDown:(BOOL)keyDown
+{
+    int stateNibble = keyDown ? 0xa : 0xb; // 0xa = key down, 0xb = key up
+
+    NSEvent *ev = [NSEvent otherEventWithType:NSEventTypeSystemDefined
+                                     location:NSZeroPoint
+                                modifierFlags:(keyDown ? 0xa00 : 0xb00)
+                                    timestamp:0
+                                 windowNumber:0
+                                      context:nil
+                                      subtype:NX_SUBTYPE_AUX_CONTROL_BUTTONS
+                                        data1:((keyCode << 16) | (stateNibble << 8))
+                                        data2:kPassThroughEventTag];
+
+    CGEventPost(kCGHIDEventTap, ev.CGEvent);
 }
 
 -(void) sendMediaKey: (int)key {
@@ -1000,7 +1085,9 @@ static NSTimeInterval updateSystemVolumeInterval=0.1f;
 
 - (void)updateSystemVolume:(NSTimer*)theTimer
 {
-	if([systemAudio isMuted])
+	if(![systemAudio hasControllableVolume])
+		[[self systemPerc] setStringValue:@"(n/a)"];
+	else if([systemAudio isMuted])
 		[[self systemPerc] setStringValue:[NSString stringWithFormat:@"(%d%%)",0]];
 	else
 		[[self systemPerc] setStringValue:[NSString stringWithFormat:@"(%d%%)",(int)[systemAudio currentVolume]]];
@@ -1426,6 +1513,11 @@ static NSTimeInterval updateSystemVolumeInterval=0.1f;
 {
 	if (volume == -1)
 		[[self systemPerc] setHidden:YES];
+	else if (![systemAudio hasControllableVolume])
+	{
+		[[self systemPerc] setHidden:NO];
+		[[self systemPerc] setStringValue:@"(n/a)"];
+	}
 	else
 	{
 		[[self systemPerc] setHidden:NO];
