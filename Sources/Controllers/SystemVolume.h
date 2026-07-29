@@ -3,7 +3,9 @@
 //  iTunes Volume Control
 //
 //  Created by Andrea Alberti on 25.12.12.
-//  Copyright (c) 2012 Andrea Alberti. All rights reserved.
+//  Copyright (c) 2012 Andrea Alberti and contributors.
+//  Modified in 2026 by Luca Leukert.
+//  SPDX-License-Identifier: GPL-3.0-only
 //
 
 #import <Cocoa/Cocoa.h>
@@ -29,6 +31,6 @@
     
 @property (assign, nonatomic) double currentVolume;  // The sound output volume (0 = minimum, 100 = maximum)
 @property (assign, nonatomic) double oldVolume;
-@property (assign, nonatomic) NSImage* icon;
+@property (strong, nonatomic) NSImage* icon;
 
 @end

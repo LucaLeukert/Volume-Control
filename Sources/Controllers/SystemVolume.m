@@ -3,7 +3,9 @@
 //  iTunes Volume Control
 //
 //  Created by Andrea Alberti on 25.12.12.
-//  Copyright (c) 2012 Andrea Alberti. All rights reserved.
+//  Copyright (c) 2012 Andrea Alberti and contributors.
+//  Modified in 2026 by Luca Leukert.
+//  SPDX-License-Identifier: GPL-3.0-only
 //
 
 #import <Carbon/Carbon.h>
@@ -114,23 +116,23 @@
 	Float32 volume = (Float32)(currentVolume / 100.);
 	UInt32 dataSize;
 
-	// Raising the volume above 0 should also clear any active mute, matching
-	// the behavior of the native macOS volume keys. We intentionally do NOT set
-	// the mute flag when the level reaches 0: a scalar of 0 already produces
-	// silence, and muting here would conflate "user lowered the volume to 0%"
-	// with an explicit device mute (handled separately via the mute key). On
-	// hardware that keeps mute and scalar independent, forcing a mute at 0%
-	// could otherwise leave the device stuck muted after the volume is raised
-	// again.
-	if (volume > 0) {
-		// Clear the mute flag in case the device was previously muted, so that
-		// raising the volume actually produces sound again.
-		UInt32 mute = 0;
+	// Match the native volume-key endpoint: mute when volume-down reaches 0,
+	// then clear mute as soon as the level is raised again. Some output devices
+	// keep producing a faint signal at their minimum scalar, so writing only a
+	// zero scalar is not sufficient to guarantee silence.
+	if (AudioObjectHasProperty(defaultOutputDeviceID, &mutePropertyAddress)) {
+		UInt32 mute = volume <= 0 ? 1 : 0;
 		dataSize = sizeof(mute);
-		AudioObjectSetPropertyData(defaultOutputDeviceID,
-								   &mutePropertyAddress,
-								   0, NULL,
-								   dataSize, &mute);
+		OSStatus muteResult = AudioObjectSetPropertyData(defaultOutputDeviceID,
+														&mutePropertyAddress,
+														0, NULL,
+														dataSize, &mute);
+		if (muteResult != noErr) {
+			NSLog(@"Failed to %@ device 0x%0x at volume %.2f",
+				  mute ? @"mute" : @"unmute",
+				  defaultOutputDeviceID,
+				  currentVolume);
+		}
 	}
 
 	dataSize = sizeof(volume);
@@ -492,10 +494,11 @@ static NSString *VCYesNo(BOOL value)
 -(id)init{
 	if (self = [super init])  {
 		[self setOldVolume:[self currentVolume]];
-        if (@available(macOS 16.0, *)) {
-            [self setIcon:[NSImage imageNamed:@"FinderTahoe"]];
+        NSURL *finderURL = [[NSWorkspace sharedWorkspace] URLForApplicationWithBundleIdentifier:@"com.apple.finder"];
+        if (finderURL != nil) {
+            [self setIcon:[[NSWorkspace sharedWorkspace] iconForFile:finderURL.path]];
         } else {
-            [self setIcon:[NSImage imageNamed:@"FinderSequoia"]];
+            [self setIcon:[NSImage imageWithSystemSymbolName:@"speaker.wave.2" accessibilityDescription:nil]];
         }
 	}
 	return self;

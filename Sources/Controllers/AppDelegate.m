@@ -4,13 +4,14 @@
 //  iTunes Volume Control
 //
 //  Created by Andrea Alberti on 25.12.12.
-//  Copyright (c) 2012 Andrea Alberti. All rights reserved.
+//  Copyright (c) 2012 Andrea Alberti and contributors.
+//  Modified in 2026 by Luca Leukert.
+//  SPDX-License-Identifier: GPL-3.0-only
 //
 
 #import "AppDelegate.h"
 #import "SystemVolume.h"
-#import "AccessibilityDialog.h"
-#import "TahoeVolumeHUD.h"
+#import "Volume_Control-Swift.h"
 
 #import <IOKit/hidsystem/ev_keymap.h>
 #import <ServiceManagement/ServiceManagement.h>
@@ -20,6 +21,15 @@
 
 #import "OSD.h"
 
+static NSImage *VCApplicationIcon(NSString *bundleIdentifier)
+{
+    NSURL *applicationURL = [[NSWorkspace sharedWorkspace] URLForApplicationWithBundleIdentifier:bundleIdentifier];
+    if (applicationURL != nil) {
+        return [[NSWorkspace sharedWorkspace] iconForFile:applicationURL.path];
+    }
+    return [NSImage imageWithSystemSymbolName:@"music.note" accessibilityDescription:nil];
+}
+
 //This will handle signals for us, specifically SIGTERM.
 void handleSIGTERM(int sig) {
 	[NSApp terminate:nil];
@@ -28,11 +38,7 @@ void handleSIGTERM(int sig) {
 #define USE_APPLE_CMD_MODIFIER_MENU_ID 3
 #define LOCK_SYSTEM_AND_PLAYER_VOLUME_ID 9
 #define START_AT_LOGIN_ID 4
-#define AUTOMATIC_UPDATES_ID 8
-#define PLAY_SOUND_FEEDBACK_ID 7
 #define TAPPING_ID 1
-#define HIDE_FROM_STATUS_BAR_ID 5
-#define HIDE_VOLUME_WINDOW_ID 6
 
 #pragma mark - Tapping key stroke events
 
@@ -83,19 +89,9 @@ CGEventRef event_tap_callback(CGEventTapProxy proxy, CGEventType type, CGEventRe
                 AppDelegate *app = (__bridge AppDelegate *)refcon;
                 [app setTapping:NO];
                 
-                NSAlert *alert = [[NSAlert alloc] init];
-                alert.messageText = @"Tapping Disabled";
-                alert.informativeText = @"Volume Control lost its ability to monitor volume keys because it became unresponsive. "
-                                        @"Tapping has been turned off. You can re-enable it from the menu.";
-                
-                [alert addButtonWithTitle:@"OK"];
-                [alert addButtonWithTitle:@"Report Issue on GitHub"];
-                
-                NSModalResponse response = [alert runModal];
-                if (response == NSAlertSecondButtonReturn) {
-                    [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:
-                                                            @"https://github.com/alberti42/Volume-Control/issues"]];
-                }
+                [[SwiftUIModalController shared]
+                    showMessage:@"Tapping Disabled"
+                    details:@"Volume Control lost access to volume-key events. Tapping was paused and can be re-enabled from the menu."];
             });
         }
         return event; // always return quickly so system input isn’t blocked
@@ -154,22 +150,16 @@ CGEventRef event_tap_callback(CGEventTapProxy proxy, CGEventType type, CGEventRe
 
 #pragma mark - Class extension for status menu
 
-@interface AppDelegate () <NSMenuDelegate>
+@interface AppDelegate ()
 {
-	//StatusItemView* _statusBarItemView;
-	NSTimer* _statusBarHideTimer;
-	NSPopover* _hideFromStatusBarHintPopover;
-	NSTextField* _hideFromStatusBarHintLabel;
-	NSTimer *_hideFromStatusBarHintPopoverUpdateTimer;
-
-	NSView* _hintView;
-	NSViewController* _hintVC;
-    
+    //StatusItemView* _statusBarItemView;
     NSTimer* accessibilityCheckTimer;
+    NSTimer* authorizationPollTimer;
     NSTimer* volumeRampTimer;
     NSTimer* timerImgSpeaker;
     NSTimer* checkPlayerTimer;
     NSTimer* updateSystemVolumeTimer;
+    NSTimer* relevantVolumeTimer;
     NSTimeInterval waitOverlayPanel;
     bool fadeInAnimationReady;
     
@@ -190,12 +180,20 @@ CGEventRef event_tap_callback(CGEventTapProxy proxy, CGEventType type, CGEventRe
 - (void) setSystemVolume:(NSInteger)volume;
 - (void)stopVolumeRampTimer;
 - (void)updatePercentages;
+- (void)refreshRelevantMenuBarVolume:(NSTimer *)timer;
 - (bool)createEventTap;
 - (void)handleEventTapDisabledByUser;
 
 @end
 
 #pragma mark - Extention music applications
+
+// ScriptingBridge players expose an integer 0...100 volume. Some players
+// report a just-written value one point lower because their internal volume is
+// normalized through a floating-point scale. Treat that as the same setting;
+// larger differences still represent a genuine external change.
+static const double playerVolumeReadbackTolerance = 1.01;
+static const double maximumProtectedVolumeIncrease = 6.0;
 
 @interface PlayerApplication () {
     dispatch_queue_t _writeQueue;  // serial queue for ScriptingBridge writes
@@ -214,6 +212,63 @@ CGEventRef event_tap_callback(CGEventTapProxy proxy, CGEventType type, CGEventRe
 @synthesize icon = _icon;
 @synthesize rampActive = _rampActive;
 
+- (NSString *)volumePreferenceBase
+{
+    if ([_bundleIdentifier isEqualToString:@"com.apple.Music"]) return @"iTunesControl";
+    if ([_bundleIdentifier isEqualToString:@"com.spotify.client"]) return @"spotifyControl";
+    if ([_bundleIdentifier isEqualToString:@"co.brushedtype.doppler-macos"]) return @"dopplerControl";
+    if ([_bundleIdentifier isEqualToString:@"com.swinsian.Swinsian"]) return @"swinsianControl";
+    return nil;
+}
+
+- (double)minimumAllowedVolume
+{
+    NSString *base = [self volumePreferenceBase];
+    if (base == nil) return 0;
+    return fmax(0, fmin(100, [[NSUserDefaults standardUserDefaults]
+                              doubleForKey:[base stringByAppendingString:@".minimumVolume"]]));
+}
+
+- (double)maximumAllowedVolume
+{
+    NSString *base = [self volumePreferenceBase];
+    if (base == nil) return 100;
+    double minimum = [self minimumAllowedVolume];
+    double maximum = [[NSUserDefaults standardUserDefaults]
+                      doubleForKey:[base stringByAppendingString:@".maximumVolume"]];
+    return fmax(minimum, fmin(100, maximum));
+}
+
+- (double)protectedVolumeForRequestedVolume:(double)requestedVolume
+{
+    if (requestedVolume < 0) return requestedVolume;
+    if (requestedVolume == 0) return 0; // Muting must always remain possible.
+
+    double bounded = round(fmax([self minimumAllowedVolume],
+                                fmin([self maximumAllowedVolume], requestedVolume)));
+    double reference = [self doubleVolume];
+
+    // A corrupt/stale target must never create one large upward write. Repeated
+    // deliberate input can still raise the volume, at most six points at once.
+    if (reference >= 0 && reference <= 100 &&
+        bounded > reference + maximumProtectedVolumeIncrease) {
+        bounded = round(reference + maximumProtectedVolumeIncrease);
+    }
+    return fmin([self maximumAllowedVolume], bounded);
+}
+
+- (double)restoreVolumeAfterMute:(double)requestedVolume
+{
+    // Restoring a value that was explicitly captured immediately before mute
+    // is not an accidental increase. Apply the configured range, but do not
+    // rate-limit the return to the remembered listening level.
+    double restored = round(fmax([self minimumAllowedVolume],
+                                 fmin([self maximumAllowedVolume], requestedVolume)));
+    [self setDoubleVolume:restored];
+    [self scheduleVolumeWrite:restored];
+    return restored;
+}
+
 - (void) setCurrentVolume:(double)currentVolume
 {
   /* We use setValue:forKey: (KVC) rather than calling setSoundVolume:
@@ -224,12 +279,16 @@ CGEventRef event_tap_callback(CGEventTapProxy proxy, CGEventType type, CGEventRe
       bypasses that ambiguity by boxing the value as NSNumber
       regardless. */
 
-    [self setDoubleVolume:currentVolume];
+    // Keep the cache, ScriptingBridge write, HUD, and subsequent key step on
+    // the same integer value. Caching a fractional value that cannot be written
+    // makes every verification read appear to move the volume backwards.
+    double canonicalVolume = [self protectedVolumeForRequestedVolume:currentVolume];
+    [self setDoubleVolume:canonicalVolume];
 
     // Negative sentinel values (e.g. -100 used during init) must not be
     // forwarded to the player — they are internal "unset" markers only.
-    if (currentVolume >= 0) {
-        [self scheduleVolumeWrite:currentVolume];
+    if (canonicalVolume >= 0) {
+        [self scheduleVolumeWrite:canonicalVolume];
     }
 }
 
@@ -256,7 +315,16 @@ CGEventRef event_tap_callback(CGEventTapProxy proxy, CGEventType type, CGEventRe
             if (self->_pendingWrite >= 0) {
                 double v = self->_pendingWrite;
                 self->_pendingWrite = -1.0;
-                [self scheduleVolumeWrite:v];
+                // Never let write coalescing turn multiple protected key steps
+                // into one large player-side increase. Preserve the final target,
+                // but send each upward segment separately.
+                if (v > volume + maximumProtectedVolumeIncrease) {
+                    double finalTarget = v;
+                    [self scheduleVolumeWrite:volume + maximumProtectedVolumeIncrease];
+                    self->_pendingWrite = finalTarget;
+                } else {
+                    [self scheduleVolumeWrite:v];
+                }
             } else {
 #ifdef DEBUG
                 // All writes have been flushed to the player.
@@ -270,7 +338,7 @@ CGEventRef event_tap_callback(CGEventTapProxy proxy, CGEventType type, CGEventRe
                     double cachedVol = [self doubleVolume];
                     NSLog(@"[VC] flush internal=%.2f  player SB=%.2f  delta=%.2f%@",
                           cachedVol, sbVol, sbVol - cachedVol,
-                          (fabs(sbVol - cachedVol) > 1.0) ? @"  ⚠️ MISMATCH" : @"");
+                          (fabs(sbVol - cachedVol) > playerVolumeReadbackTolerance) ? @"  ⚠️ MISMATCH" : @"");
                 }
 #endif
             }
@@ -294,7 +362,7 @@ CGEventRef event_tap_callback(CGEventTapProxy proxy, CGEventType type, CGEventRe
         double sbVol = [[self->musicPlayer valueForKey:@"soundVolume"] doubleValue];
         NSLog(@"[VC] verify  internal=%.2f  player SB=%.2f  delta=%.2f%@",
               expected, sbVol, sbVol - expected,
-              (fabs(sbVol - expected) > 1.0) ? @"  ⚠️ MISMATCH" : @"");
+              (fabs(sbVol - expected) > playerVolumeReadbackTolerance) ? @"  ⚠️ MISMATCH" : @"");
     });
 #endif
 }
@@ -310,8 +378,11 @@ CGEventRef event_tap_callback(CGEventTapProxy proxy, CGEventType type, CGEventRe
 
   double vol = [[musicPlayer valueForKey:@"soundVolume"] doubleValue];
 
-  if (fabs(vol-[self doubleVolume])<1) {
+  if (fabs(vol-[self doubleVolume]) <= playerVolumeReadbackTolerance) {
     vol = [self doubleVolume];
+  } else if (!_writeInFlight && _pendingWrite < 0 && !_rampActive) {
+    // Establish a trustworthy baseline for upward-jump protection.
+    [self setDoubleVolume:round(fmin(100, fmax(0, vol)))];
   }
 
 	return vol;
@@ -352,7 +423,7 @@ CGEventRef event_tap_callback(CGEventTapProxy proxy, CGEventType type, CGEventRe
 	if (self = [super init])  {
         _bundleIdentifier = [bundleIdentifier copy];
         _playerStateScript = nil;
-        _writeQueue    = dispatch_queue_create("io.alberti42.VolumeControl.sbWrite", DISPATCH_QUEUE_SERIAL);
+        _writeQueue    = dispatch_queue_create("de.lucaleukert.VolumeControl.sbWrite", DISPATCH_QUEUE_SERIAL);
         _writeInFlight = NO;
         _pendingWrite  = -1.0;
 		[self setCurrentVolume: -100];
@@ -375,30 +446,10 @@ CGEventRef event_tap_callback(CGEventTapProxy proxy, CGEventType type, CGEventRe
 @synthesize UseAppleCMDModifier=_UseAppleCMDModifier;
 @synthesize LockSystemAndPlayerVolume=_LockSystemAndPlayerVolume;
 @synthesize AppleCMDModifierPressed=_AppleCMDModifierPressed;
-@synthesize AutomaticUpdates=_AutomaticUpdates;
-@synthesize hideFromStatusBar = _hideFromStatusBar;
-@synthesize hideVolumeWindow = _hideVolumeWindow;
 @synthesize loadIntroAtStart = _loadIntroAtStart;
 @synthesize statusBar = _statusBar;
 
-@synthesize iTunesBtn = _iTunesBtn;
-@synthesize spotifyBtn = _spotifyBtn;
-@synthesize systemBtn = _systemBtn;
-@synthesize dopplerBtn = _dopplerBtn;
-@synthesize swinsianBtn = _swinsianBtn;
-
-@synthesize iTunesPerc = _iTunesPerc;
-@synthesize spotifyPerc = _spotifyPerc;
-@synthesize systemPerc = _systemPerc;
-@synthesize dopplerPerc = _dopplerPerc;
-@synthesize swinsianPerc = _swinsianPerc;
-
-@synthesize sparkle_updater = _sparkle_updater;
-
-@synthesize statusMenu = _statusMenu;
-
 static NSTimeInterval volumeRampTimeInterval=0.01f;
-static NSTimeInterval statusBarHideDelay=10.0f;
 static NSTimeInterval checkPlayerTimeout=0.3f;
 //static NSTimeInterval volumeLockSyncInterval=1.0f;
 static NSTimeInterval updateSystemVolumeInterval=0.1f;
@@ -432,11 +483,12 @@ static NSTimeInterval updateSystemVolumeInterval=0.1f;
     
     _statusBar = nil;
     
-    accessibilityDialog = nil;
     introWindowController = nil;
     
     [volumeRampTimer invalidate];
     volumeRampTimer = nil;
+    [relevantVolumeTimer invalidate];
+    relevantVolumeTimer = nil;
     
     [checkPlayerTimer invalidate];
     checkPlayerTimer = nil;
@@ -446,6 +498,10 @@ static NSTimeInterval updateSystemVolumeInterval=0.1f;
     
     [updateSystemVolumeTimer invalidate];
     updateSystemVolumeTimer = nil;
+    [accessibilityCheckTimer invalidate];
+    accessibilityCheckTimer = nil;
+    [authorizationPollTimer invalidate];
+    authorizationPollTimer = nil;
     
     preferences = nil;
     
@@ -459,9 +515,6 @@ static NSTimeInterval updateSystemVolumeInterval=0.1f;
 
 - (void)updateStartAtLoginMenuItem
 {
-    BOOL enabled = [self StartAtLogin];
-    NSMenuItem* menuItem = [self.statusMenu itemWithTag:START_AT_LOGIN_ID];
-    [menuItem setState:enabled ? NSControlStateValueOn : NSControlStateValueOff];
 }
 
 - (IBAction)toggleStartAtLogin:(id)sender {
@@ -549,17 +602,23 @@ static NSTimeInterval updateSystemVolumeInterval=0.1f;
 
 - (void)wasAuthorized
 {
-    [accessibilityDialog close];
-    accessibilityDialog = nil;
-    
+    [authorizationPollTimer invalidate];
+    authorizationPollTimer = nil;
+    [[SwiftUIAccessibilityController shared] close];
     [self completeInitialization];
+}
+
+- (void)pollAccessibilityAuthorization:(NSTimer *)timer
+{
+    if ([self tryCreateEventTap]) {
+        [self wasAuthorized];
+    }
 }
 
 - (void)stopVolumeRampTimer
 {
     [volumeRampTimer invalidate];
     volumeRampTimer=nil;
-    [self emitAcousticFeedback];
 
     checkPlayerTimer = [NSTimer timerWithTimeInterval:checkPlayerTimeout target:self selector:@selector(resetCurrentPlayer:) userInfo:nil repeats:NO];
     [[NSRunLoop mainRunLoop] addTimer:checkPlayerTimer forMode:NSRunLoopCommonModes];
@@ -681,12 +740,7 @@ static NSTimeInterval updateSystemVolumeInterval=0.1f;
     [self setTapping:NO];
     
     dispatch_async(dispatch_get_main_queue(), ^{
-        NSAlert *alert = [[NSAlert alloc] init];
-        alert.messageText = @"Accessibility Permission Revoked";
-        alert.informativeText = @"Volume Control has lost permission to monitor keyboard events. "
-        @"Keyboard input may stop working until you restore permission in "
-        @"System Settings → Privacy & Security → Accessibility.";
-        [alert runModal];
+        [[SwiftUIAccessibilityController shared] show];
     });
 }
 
@@ -833,38 +887,35 @@ static NSTimeInterval updateSystemVolumeInterval=0.1f;
 				[systemAudio setCurrentVolume:0];
 			}
 
-            if(!_hideVolumeWindow){
-                if (@available(macOS 16.0, *)) {
-                    // On Tahoe, show the new popover HUD.
-                    [[TahoeVolumeHUD sharedManager] showHUDWithVolume:0 usingMusicPlayer:runningPlayerPtr andLabel:[systemAudio getDefaultOutputDeviceName]  anchoredToStatusButton:([self hideFromStatusBar] ? nil : self.statusBar.button)];
-                } else {
-                    // On older systems, use the classic OSD.
-                    id osdMgr = [self->OSDManager sharedManager];
-                    if (osdMgr) {
-                        [osdMgr showImage:OSDGraphicSpeakerMute onDisplayID:CGSMainDisplayID() priority:OSDPriorityDefault msecUntilFade:1000 filledChiclets:0 totalChiclets:(unsigned int)100 locked:NO];
-                    }
+            if (@available(macOS 16.0, *)) {
+                [[TahoeVolumeHUD sharedManager] showHUDWithVolume:0 usingMusicPlayer:runningPlayerPtr andLabel:[systemAudio getDefaultOutputDeviceName]];
+            } else {
+                id osdMgr = [self->OSDManager sharedManager];
+                if (osdMgr) {
+                    [osdMgr showImage:OSDGraphicSpeakerMute onDisplayID:CGSMainDisplayID() priority:OSDPriorityDefault msecUntilFade:1000 filledChiclets:0 totalChiclets:(unsigned int)100 locked:NO];
                 }
             }
 		}
 		else
 		{
-			[runningPlayerPtr setCurrentVolume:[runningPlayerPtr oldVolume]];
+            double restoredVolume = [runningPlayerPtr oldVolume];
+			if ([runningPlayerPtr isKindOfClass:[PlayerApplication class]]) {
+                restoredVolume = [(PlayerApplication *)runningPlayerPtr
+                                  restoreVolumeAfterMute:restoredVolume];
+            } else {
+                [runningPlayerPtr setCurrentVolume:restoredVolume];
+			}
 
 			if (_LockSystemAndPlayerVolume && runningPlayerPtr != systemAudio) {
-				[systemAudio setCurrentVolume:[systemAudio oldVolume]];
+				[systemAudio setCurrentVolume:restoredVolume];
 			}
             
-            if(!_hideVolumeWindow)
-            {
-                if (@available(macOS 16.0, *)) {
-                    // On Tahoe, show the new popover HUD.
-                    [[TahoeVolumeHUD sharedManager] showHUDWithVolume:[runningPlayerPtr oldVolume] usingMusicPlayer:runningPlayerPtr andLabel:[systemAudio getDefaultOutputDeviceName] anchoredToStatusButton:([self hideFromStatusBar] ? nil : self.statusBar.button)];
-                } else {
-                    // On older systems, use the classic OSD.
-                    id osdMgr = [self->OSDManager sharedManager];
-                    if (osdMgr) {
-                        [osdMgr showImage:OSDGraphicSpeaker onDisplayID:CGSMainDisplayID() priority:OSDPriorityDefault msecUntilFade:1000 filledChiclets:(unsigned int)[runningPlayerPtr oldVolume] totalChiclets:(unsigned int)100 locked:NO];
-                    }
+            if (@available(macOS 16.0, *)) {
+                [[TahoeVolumeHUD sharedManager] showHUDWithVolume:restoredVolume usingMusicPlayer:runningPlayerPtr andLabel:[systemAudio getDefaultOutputDeviceName]];
+            } else {
+                id osdMgr = [self->OSDManager sharedManager];
+                if (osdMgr) {
+                    [osdMgr showImage:OSDGraphicSpeaker onDisplayID:CGSMainDisplayID() priority:OSDPriorityDefault msecUntilFade:1000 filledChiclets:(unsigned int)restoredVolume totalChiclets:(unsigned int)100 locked:NO];
                 }
             }
             
@@ -939,14 +990,6 @@ static NSTimeInterval updateSystemVolumeInterval=0.1f;
 
 -(void)completeInitialization
 {
-	SPUUpdater* updater = [[self sparkle_updater] updater];
-	[updater clearFeedURLFromUserDefaults];
-	[[self sparkle_updater] userDriver];
-	[updater setUpdateCheckInterval:60*60*24*7]; // look for new updates every 7 days
-
-	//[[SUUpdater sharedUpdater] setFeedURL:[NSURL URLWithString:[NSString stringWithFormat: @"http://quantum-technologies.iap.uni-bonn.de/alberti/iTunesVolumeControl/VolumeControlCast.xml.php?version=%@&osxversion=%@",version,[operatingSystemVersionString stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]]]]];
-	//[[SUUpdater sharedUpdater] setUpdateCheckInterval:60*60*24*7]; // look for new updates every 7 days
-
 	// [self _loadBezelServices]; // El Capitan and probably older systems
     if (@available(macOS 16.0, *)) {
         // Running on Tahoe (2026) or newer
@@ -955,17 +998,17 @@ static NSTimeInterval updateSystemVolumeInterval=0.1f;
         self->OSDManager = NSClassFromString(@"OSDManager");
     }
 
-    if (@available(macOS 16.0, *)) {
-        iTunes = [[PlayerApplication alloc] initWithBundleIdentifier:@"com.apple.Music" andIcon:[NSImage imageNamed:@"AppleMusicTahoe"]];
-    } else {
-        iTunes = [[PlayerApplication alloc] initWithBundleIdentifier:@"com.apple.Music" andIcon:[NSImage imageNamed:@"AppleMusicSequoia"]];
-    }
+    iTunes = [[PlayerApplication alloc] initWithBundleIdentifier:@"com.apple.Music"
+                                                        andIcon:VCApplicationIcon(@"com.apple.Music")];
 	
-    spotify = [[PlayerApplication alloc] initWithBundleIdentifier:@"com.spotify.client" andIcon:[NSImage imageNamed:@"spotify"]];
+    spotify = [[PlayerApplication alloc] initWithBundleIdentifier:@"com.spotify.client"
+                                                         andIcon:VCApplicationIcon(@"com.spotify.client")];
 
-    doppler = [[PlayerApplication alloc] initWithBundleIdentifier:@"co.brushedtype.doppler-macos" andIcon:[NSImage imageNamed:@"doppler"]];
+    doppler = [[PlayerApplication alloc] initWithBundleIdentifier:@"co.brushedtype.doppler-macos"
+                                                         andIcon:VCApplicationIcon(@"co.brushedtype.doppler-macos")];
 
-    swinsian = [[PlayerApplication alloc] initWithBundleIdentifier:@"com.swinsian.Swinsian" andIcon:[NSImage imageNamed:@"swinsian"]];
+    swinsian = [[PlayerApplication alloc] initWithBundleIdentifier:@"com.swinsian.Swinsian"
+                                                          andIcon:VCApplicationIcon(@"com.swinsian.Swinsian")];
 
 	// Force MacOS to ask for authorization to AppleEvents if this was not already given
 	if([iTunes isRunning])
@@ -979,25 +1022,25 @@ static NSTimeInterval updateSystemVolumeInterval=0.1f;
 
 	systemAudio = [[SystemApplication alloc] init];
 
-	// Install icon into the menu bar
-	[self showInStatusBarWithCompletion:^{
-		// This code will only run AFTER the icon has been created and is visible.
-
-		// Initiate hiding it
-		if([self hideFromStatusBar]) {
-			// NSLog(@"Started hiding from status bar");
-			[self setHideFromStatusBar:YES];
-		}
-	}];
-
 	// NSString* iTunesVersion = [[NSString alloc] initWithString:[iTunes version]];
 	// NSString* spotifyVersion = [[NSString alloc] initWithString:[spotify version]];
 
 	[self initializePreferences];
 
+    // At rest, the status item represents the source that the normal volume
+    // keys currently control (a playing player wins over system audio).
+    if (@available(macOS 16.0, *)) {
+        [self refreshRelevantMenuBarVolume:nil];
+        relevantVolumeTimer = [NSTimer timerWithTimeInterval:1.0
+                                                      target:self
+                                                    selector:@selector(refreshRelevantMenuBarVolume:)
+                                                    userInfo:nil
+                                                     repeats:YES];
+        [[NSRunLoop mainRunLoop] addTimer:relevantVolumeTimer forMode:NSRunLoopCommonModes];
+    }
+
 	[self setStartAtLogin:[self StartAtLogin] savePreferences:false];
 
-	volumeSound = [[NSSound alloc] initWithContentsOfFile:@"/System/Library/LoginPlugins/BezelServices.loginPlugin/Contents/Resources/volume.aiff" byReference:false];
 }
 
 - (BOOL)validateMenuItem:(NSMenuItem *)menuItem {
@@ -1007,18 +1050,31 @@ static NSTimeInterval updateSystemVolumeInterval=0.1f;
 	return YES; // Default behavior
 }
 
-- (void)emitAcousticFeedback
+- (void)applicationWillFinishLaunching:(NSNotification *)notification
 {
-	if([self PlaySoundFeedback] && (_AppleCMDModifierPressed != _UseAppleCMDModifier || [[self runningPlayer] isKindOfClass:[SystemApplication class]]))
-	{
-		if([volumeSound isPlaying])
-			[volumeSound stop];
-		[volumeSound play];
-	}
+    NSString *bundleIdentifier = NSBundle.mainBundle.bundleIdentifier;
+    if (bundleIdentifier.length == 0) {
+        return;
+    }
+
+    pid_t currentPID = NSProcessInfo.processInfo.processIdentifier;
+    for (NSRunningApplication *application in
+         [NSRunningApplication runningApplicationsWithBundleIdentifier:bundleIdentifier]) {
+        // Launch Services normally prevents the duplicate before it reaches
+        // this point. The PID tie-break also covers directly executing the
+        // binary and prevents two simultaneous launches from both surviving.
+        if (!application.terminated && application.processIdentifier < currentPID) {
+            [application activateWithOptions:0];
+            [NSApp terminate:nil];
+            return;
+        }
+    }
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification
 {
+    [[MenuBarStatusController shared] installWithDelegate:self];
+
 	[[[NSWorkspace sharedWorkspace] notificationCenter] addObserver: self selector: @selector(receiveWakeNote:) name:NSWorkspaceDidWakeNotification object: NULL];
 
 	signal(SIGTERM, handleSIGTERM);
@@ -1026,78 +1082,19 @@ static NSTimeInterval updateSystemVolumeInterval=0.1f;
 	if ([self tryCreateEventTap]) {
 		[self completeInitialization];
 	} else {
-		// Not yet trusted, show helper dialog
-		accessibilityDialog = [[AccessibilityDialog alloc] initWithWindowNibName:@"AccessibilityDialog"];
-		[accessibilityDialog showWindow:self];
+        [[SwiftUIAccessibilityController shared] show];
+        authorizationPollTimer = [NSTimer scheduledTimerWithTimeInterval:0.3
+                                                                   target:self
+                                                                 selector:@selector(pollAccessibilityAuthorization:)
+                                                                 userInfo:nil
+                                                                  repeats:YES];
 	}
     
     [TahoeVolumeHUD sharedManager].delegate = self;
 }
 
-- (BOOL)applicationShouldHandleReopen:(NSApplication *)sender hasVisibleWindows:(BOOL)flag
-{
-    if ([self hideFromStatusBar]) {
-		// First, tell the status bar to show itself.
-		[self showInStatusBarWithCompletion:^{
-			// This code will only run AFTER the icon has been created and is visible.
-
-			// Initiate hiding it
-			[self setHideFromStatusBar:YES];
-
-            // Actively show the popover to make sure user notices; delay it until status item has settled in its final position
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                [self showHideFromStatusBarHintPopover];
-            });
-		}];
-	}
-	return false;
-}
-
-- (void)showInStatusBarWithCompletion:(void (^)(void))completion
-{
-	if (!self.statusBar) {
-		// the status bar item needs a custom view so that we can show a NSPopover for the hide-from-status-bar hint
-		// the view now reacts to the mouseDown event to show the menu
-		self.statusBar = [[NSStatusBar systemStatusBar] statusItemWithLength:NSSquareStatusItemLength];
-		self.statusBar.menu = self.statusMenu;
-	}
-
-	// Defer the button configuration to the next run loop cycle.
-	// This allows the system to create and place the status item
-	// before you try to modify its view hierarchy.
-	dispatch_async(dispatch_get_main_queue(), ^{
-		// Show the status bar item first.
-		[self showStatusBarItem];
-
-		NSImage *icon = [NSImage imageNamed:@"statusbar-icon"];
-		icon.template = YES;
-
-		if (self.statusBar.button) {
-			self.statusBar.button.image = icon;
-		}
-
-		// Now that the UI work is complete, call the completion handler.
-		if (completion) {
-			completion();
-		}
-	});
-}
-
-
 - (void)updateSystemVolume:(NSTimer*)theTimer
 {
-	BOOL controllable = [systemAudio hasControllableVolume];
-
-	// Keep the System check mark in sync with availability (see setSystemVolume:).
-	[[self systemBtn] setState:controllable ? NSControlStateValueOn : NSControlStateValueOff];
-
-	if(!controllable)
-		[[self systemPerc] setStringValue:@"(n/a)"];
-	else if([systemAudio isMuted])
-		[[self systemPerc] setStringValue:[NSString stringWithFormat:@"(%d%%)",0]];
-	else
-		[[self systemPerc] setStringValue:[NSString stringWithFormat:@"(%d%%)",(int)[systemAudio currentVolume]]];
 }
 
 - (void)initializePreferences
@@ -1108,82 +1105,33 @@ static NSTimeInterval updateSystemVolumeInterval=0.1f;
 						  [NSNumber numberWithBool:true] , @"TappingEnabled",
 						  [NSNumber numberWithBool:false], @"UseAppleCMDModifier",
 						  [NSNumber numberWithBool:false], @"LockSystemAndPlayerVolume",
-						  [NSNumber numberWithBool:true],  @"AutomaticUpdates",
-						  [NSNumber numberWithBool:false], @"hideFromStatusBarPreference",
-						  [NSNumber numberWithBool:false], @"hideVolumeWindowPreference",
-						  [NSNumber numberWithBool:true],  @"iTunesControl",
-						  [NSNumber numberWithBool:true],  @"spotifyControl",
-						  [NSNumber numberWithBool:true],  @"dopplerControl",
-						  [NSNumber numberWithBool:true],  @"swinsianControl",
+						  [NSNumber numberWithBool:false], @"iTunesControl",
+						  [NSNumber numberWithBool:false], @"spotifyControl",
+						  [NSNumber numberWithBool:false], @"dopplerControl",
+						  [NSNumber numberWithBool:false], @"swinsianControl",
 						  [NSNumber numberWithBool:true],  @"systemControl",
-						  [NSNumber numberWithBool:true],  @"PlaySoundFeedback",
+                          @0,   @"iTunesControl.minimumVolume",
+                          @100, @"iTunesControl.maximumVolume",
+                          @0,   @"spotifyControl.minimumVolume",
+                          @100, @"spotifyControl.maximumVolume",
+                          @0,   @"dopplerControl.minimumVolume",
+                          @100, @"dopplerControl.maximumVolume",
+                          @0,   @"swinsianControl.minimumVolume",
+                          @100, @"swinsianControl.maximumVolume",
 						  nil ]; // terminate the list
 	[preferences registerDefaults:dict];
     
 	[self setTapping:[preferences boolForKey:              @"TappingEnabled"]];
 	[self setUseAppleCMDModifier:[preferences boolForKey:  @"UseAppleCMDModifier"]];
 	[self setLockSystemAndPlayerVolume:[preferences boolForKey:  @"LockSystemAndPlayerVolume"]];
-	[self setAutomaticUpdates:[preferences boolForKey:     @"AutomaticUpdates"]];
-	[self setHideFromStatusBar:[preferences boolForKey:    @"hideFromStatusBarPreference"]];
-    [self setHideVolumeWindow:[preferences boolForKey:     @"hideVolumeWindowPreference"]];
-	[[self iTunesBtn] setState:[preferences boolForKey:    @"iTunesControl"]];
-	if (@available(macOS 10.15, *)) {
-		[[self iTunesBtn] setTitle:@"Music"];
-	}
-	[[self iTunesBtn] setState:[preferences boolForKey:    @"iTunesControl"]];
-	[[self spotifyBtn] setState:[preferences boolForKey:   @"spotifyControl"]];
-	[[self dopplerBtn] setState:[preferences boolForKey:   @"dopplerControl"]];
-	[[self swinsianBtn] setState:[preferences boolForKey:  @"swinsianControl"]];
-	//[[self systemBtn] setState:[preferences boolForKey:    @"systemControl"]];
-	[[self systemBtn] setState:true];  // hard coded always to true
-	[[self systemBtn] setEnabled:false];
-	[self setPlaySoundFeedback:[preferences boolForKey:     @"PlaySoundFeedback"]];
 
 	NSInteger volumeIncSetting = [preferences integerForKey:@"volumeIncrement"];
 	[self setVolumeInc:volumeIncSetting];
 
-	[[self volumeIncrementsSlider] setIntegerValue: volumeIncSetting];
-}
-
-- (IBAction)toggleAutomaticUpdates:(id)sender
-{
-	[self setAutomaticUpdates:![self AutomaticUpdates]];
-}
-
-- (void) setAutomaticUpdates:(bool)enabled
-{
-	NSMenuItem* menuItem=[_statusMenu itemWithTag:AUTOMATIC_UPDATES_ID];
-	[menuItem setState:enabled];
-
-	[preferences setBool:enabled forKey:@"AutomaticUpdates"];
-	[preferences synchronize];
-
-	_AutomaticUpdates=enabled;
-
-	[[[self sparkle_updater] updater] setAutomaticallyChecksForUpdates:enabled];
-}
-
-- (IBAction)togglePlaySoundFeedback:(id)sender
-{
-	[self setPlaySoundFeedback:![self PlaySoundFeedback]];
-}
-
-- (void)setPlaySoundFeedback:(bool)enabled
-{
-	[preferences setBool:enabled forKey:@"PlaySoundFeedback"];
-	[preferences synchronize];
-
-	NSMenuItem* menuItem=[_statusMenu itemWithTag:PLAY_SOUND_FEEDBACK_ID];
-	[menuItem setState:enabled];
-
-	_PlaySoundFeedback=enabled;
 }
 
 - (void) setUseAppleCMDModifier:(bool)enabled
 {
-	NSMenuItem* menuItem=[_statusMenu itemWithTag:USE_APPLE_CMD_MODIFIER_MENU_ID];
-	[menuItem setState:enabled];
-
 	[preferences setBool:enabled forKey:@"UseAppleCMDModifier"];
 	[preferences synchronize];
 
@@ -1226,9 +1174,6 @@ static NSTimeInterval updateSystemVolumeInterval=0.1f;
 
 - (void) setLockSystemAndPlayerVolume:(bool)enabled
 {
-	NSMenuItem* menuItem=[_statusMenu itemWithTag:LOCK_SYSTEM_AND_PLAYER_VOLUME_ID];
-	[menuItem setState:enabled];
-
 	[preferences setBool:enabled forKey:@"LockSystemAndPlayerVolume"];
 	[preferences synchronize];
 
@@ -1260,15 +1205,13 @@ static NSTimeInterval updateSystemVolumeInterval=0.1f;
         }
     }
     
-    NSMenuItem *menuItem = [_statusMenu itemWithTag:TAPPING_ID];
-    [menuItem setState:enabled];
-
     [[[self statusBar] button] setAppearsDisabled:!enabled];
 
     [preferences setBool:enabled forKey:@"TappingEnabled"];
     [preferences synchronize];
 
     _Tapping = enabled;
+    [[MenuBarStatusController shared] refreshEnabledState];
 }
 
 - (IBAction)toggleTapping:(id)sender
@@ -1276,15 +1219,18 @@ static NSTimeInterval updateSystemVolumeInterval=0.1f;
 	[self setTapping:![self Tapping]];
 }
 
-- (IBAction)sliderValueChanged:(NSSliderCell*)slider
+- (void)updateVolumeIncrement:(NSInteger)volumeIncSetting
 {
-	NSInteger volumeIncSetting = [[self volumeIncrementsSlider] integerValue];
-
 	[self setVolumeInc:volumeIncSetting];
 
 	[preferences setInteger:volumeIncSetting forKey:@"volumeIncrement"];
 	[preferences synchronize];
 
+}
+
+- (void)updateVolumeIncrementNumber:(NSNumber *)value
+{
+    [self updateVolumeIncrement:value.integerValue];
 }
 
 - (void) setVolumeInc:(NSInteger)volumeIncSetting
@@ -1313,20 +1259,21 @@ static NSTimeInterval updateSystemVolumeInterval=0.1f;
 
 - (IBAction)aboutPanel:(id)sender
 {
-    NSDictionary *infoDict = [[NSBundle mainBundle] infoDictionary];
-    
-    NSString *shortVersion = infoDict[@"CFBundleShortVersionString"]; // e.g. "1.7.7"
-    NSString *buildNumber  = infoDict[@"CFBundleVersion"];            // e.g. "190"
-    
-    NSDictionary *options = @{NSAboutPanelOptionApplicationVersion: shortVersion, NSAboutPanelOptionVersion: buildNumber};
-    
-    [[NSApplication sharedApplication] activateIgnoringOtherApps:YES];
-    [[NSApplication sharedApplication] orderFrontStandardAboutPanelWithOptions:options];
+    NSDictionary *info = [NSBundle mainBundle].infoDictionary;
+    NSString *shortVersion = info[@"CFBundleShortVersionString"] ?: @"—";
+    NSString *buildNumber = info[@"CFBundleVersion"] ?: @"—";
+
+    // Use AppKit's native About panel. Besides matching the rest of macOS, it
+    // avoids the remote SwiftUI theme-widget connection used by the previous
+    // custom glass window.
+    [NSApp activateIgnoringOtherApps:YES];
+    [NSApp orderFrontStandardAboutPanelWithOptions:@{
+        NSAboutPanelOptionApplicationVersion: shortVersion,
+        NSAboutPanelOptionVersion: buildNumber
+    }];
 }
 
 #pragma mark - Diagnostics
-
-static NSString * const kGitHubIssuesURL = @"https://github.com/alberti42/Volume-Control/issues";
 
 // hw.model, e.g. "MacBookPro18,3".
 - (NSString *)hardwareModel
@@ -1408,59 +1355,9 @@ static NSString * const kGitHubIssuesURL = @"https://github.com/alberti42/Volume
     return r;
 }
 
-// A selectable text field showing the GitHub issues URL as a clickable link,
-// for use as an NSAlert accessory view.
-- (NSTextField *)diagnosticsLinkField
-{
-    NSTextField *field = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 420, 18)];
-    [field setBezeled:NO];
-    [field setDrawsBackground:NO];
-    [field setEditable:NO];
-    [field setSelectable:YES];
-    [field setAllowsEditingTextAttributes:YES];
-
-    NSMutableAttributedString *attr = [[NSMutableAttributedString alloc] initWithString:kGitHubIssuesURL];
-    NSRange range = NSMakeRange(0, kGitHubIssuesURL.length);
-    [attr addAttribute:NSLinkAttributeName value:kGitHubIssuesURL range:range];
-    [attr addAttribute:NSForegroundColorAttributeName value:[NSColor linkColor] range:range];
-    [attr addAttribute:NSUnderlineStyleAttributeName value:@(NSUnderlineStyleSingle) range:range];
-    [field setAttributedStringValue:attr];
-    [field sizeToFit];
-
-    return field;
-}
-
 - (IBAction)copyDiagnostics:(id)sender
 {
-    [[NSApplication sharedApplication] activateIgnoringOtherApps:YES];
-
-    NSAlert *alert = [[NSAlert alloc] init];
-    alert.messageText = @"Copy Diagnostics";
-    alert.informativeText = @"Volume Control will copy a diagnostics report to your clipboard, "
-                            @"replacing its current contents.\n\n"
-                            @"Nothing is sent over the Internet — it is plain text you can read and "
-                            @"edit before sharing, for example when opening a GitHub issue:";
-    alert.accessoryView = [self diagnosticsLinkField];
-    [alert addButtonWithTitle:@"Copy to Clipboard"]; // NSAlertFirstButtonReturn (default)
-    [alert addButtonWithTitle:@"Cancel"];
-
-    if ([alert runModal] != NSAlertFirstButtonReturn) {
-        return;
-    }
-
-    NSPasteboard *pasteboard = [NSPasteboard generalPasteboard];
-    [pasteboard clearContents];
-    [pasteboard setString:[self diagnosticsReport] forType:NSPasteboardTypeString];
-
-    NSAlert *done = [[NSAlert alloc] init];
-    done.messageText = @"Diagnostics Copied";
-    done.informativeText = @"The report is on your clipboard. Paste it into your GitHub issue.";
-    [done addButtonWithTitle:@"Visit GitHub Issues Page"]; // NSAlertFirstButtonReturn
-    [done addButtonWithTitle:@"Done"];
-
-    if ([done runModal] == NSAlertFirstButtonReturn) {
-        [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:kGitHubIssuesURL]];
-    }
+    [[SwiftUIModalController shared] showDiagnostics:[self diagnosticsReport]];
 }
 
 - (void) receiveWakeNote: (NSNotification*) note
@@ -1488,23 +1385,23 @@ static NSString * const kGitHubIssuesURL = @"https://github.com/alberti42/Volume
 
 	if(_AppleCMDModifierPressed == _UseAppleCMDModifier)
 	{
-		if([_iTunesBtn state] && [iTunes isRunning] && [iTunes playerState] == iTunesEPlSPlaying)
+		if([preferences boolForKey:@"iTunesControl"] && [iTunes isRunning] && [iTunes playerState] == iTunesEPlSPlaying)
 		{
 			currentPlayer = iTunes;
 		}
-		else if([_spotifyBtn state] && [spotify isRunning] && (SpotifyEPlS)[spotify playerState] == SpotifyEPlSPlaying)
+		else if([preferences boolForKey:@"spotifyControl"] && [spotify isRunning] && (SpotifyEPlS)[spotify playerState] == SpotifyEPlSPlaying)
 		{
 			currentPlayer = spotify;
 		}
-		else if([_dopplerBtn state] && [doppler isRunning] && (DopplerEPlS)[doppler playerState] == DopplerEPlSPlaying)
+		else if([preferences boolForKey:@"dopplerControl"] && [doppler isRunning] && (DopplerEPlS)[doppler playerState] == DopplerEPlSPlaying)
 		{
 			currentPlayer = doppler;
 		}
-		else if([_swinsianBtn state] && [swinsian isRunning] && (SwinsianPlayerState)[swinsian playerState] == SwinsianPlayerStatePlaying)
+		else if([preferences boolForKey:@"swinsianControl"] && [swinsian isRunning] && (SwinsianPlayerState)[swinsian playerState] == SwinsianPlayerStatePlaying)
 		{
 			currentPlayer = swinsian;
 		}
-		else if([_systemBtn state])
+		else
 		{
 			currentPlayer = systemAudio;
 		}
@@ -1513,6 +1410,48 @@ static NSString * const kGitHubIssuesURL = @"https://github.com/alberti42/Volume
 		currentPlayer = systemAudio;
 
 	return currentPlayer;
+}
+
+- (void)refreshRelevantMenuBarVolume:(NSTimer *)timer
+{
+    // Re-evaluate instead of using the short key-repeat cache so starting or
+    // stopping playback is reflected even when no volume key is pressed.
+    [checkPlayerTimer invalidate];
+    checkPlayerTimer = nil;
+    currentPlayer = nil;
+
+    id relevantPlayer = [self runningPlayer];
+    if (relevantPlayer != nil) {
+        double volume = [relevantPlayer currentVolume];
+        if ([relevantPlayer isKindOfClass:[PlayerApplication class]]) {
+            double maximum = [(PlayerApplication *)relevantPlayer maximumAllowedVolume];
+            if (volume > maximum) {
+                volume = maximum;
+                [relevantPlayer setCurrentVolume:volume];
+                if (_LockSystemAndPlayerVolume) [systemAudio setCurrentVolume:volume];
+            }
+        }
+        [[TahoeVolumeHUD sharedManager] setMenuBarVolume:volume
+                                       usingMusicPlayer:relevantPlayer];
+    }
+}
+
+- (void)applyVolumeLimitForPreference:(NSString *)preference
+{
+    PlayerApplication *player = nil;
+    if ([preference isEqualToString:@"iTunesControl"]) player = iTunes;
+    else if ([preference isEqualToString:@"spotifyControl"]) player = spotify;
+    else if ([preference isEqualToString:@"dopplerControl"]) player = doppler;
+    else if ([preference isEqualToString:@"swinsianControl"]) player = swinsian;
+
+    if (player == nil || ![player isRunning]) return;
+    double current = [player currentVolume];
+    double maximum = [player maximumAllowedVolume];
+    if (current > maximum) {
+        [player setCurrentVolume:maximum];
+        if (_LockSystemAndPlayerVolume) [systemAudio setCurrentVolume:maximum];
+        [[TahoeVolumeHUD sharedManager] setMenuBarVolume:maximum usingMusicPlayer:player];
+    }
 }
 
 - (void)setVolumeUp:(bool)increase
@@ -1536,6 +1475,7 @@ static NSString * const kGitHubIssuesURL = @"https://github.com/alberti42/Volume
 #ifdef DEBUG
         double dbgPrevVolume = volume; // internal belief before this step
 #endif
+        BOOL restoredPlayerFromMute = NO;
 
 		if([runningPlayerPtr oldVolume]<0) // if it was not mute
 		{
@@ -1546,10 +1486,22 @@ static NSString * const kGitHubIssuesURL = @"https://github.com/alberti42/Volume
 		{
 			// [volumeImageLayer setContents:imgVolOn];  // restore the image of the speaker from mute speaker
 			volume=[runningPlayerPtr oldVolume];
+            if ([runningPlayerPtr isKindOfClass:[PlayerApplication class]]) {
+                volume = [(PlayerApplication *)runningPlayerPtr
+                          restoreVolumeAfterMute:volume];
+                restoredPlayerFromMute = YES;
+            }
 			[runningPlayerPtr setOldVolume:-1];  // this says that it is not mute
 		}
 		if (volume<0) volume=0;
 		if (volume>100) volume=100;
+
+        // Player APIs only accept whole percentages. Quantize before presenting
+        // the value so the HUD and status icon cannot disagree with the cache.
+        if ([runningPlayerPtr isKindOfClass:[PlayerApplication class]]) {
+            volume = [(PlayerApplication *)runningPlayerPtr
+                      protectedVolumeForRequestedVolume:round(volume)];
+        }
         
         OSDGraphic image = 0;
         NSInteger numFullBlks = 0;
@@ -1565,35 +1517,29 @@ static NSString * const kGitHubIssuesURL = @"https://github.com/alberti42/Volume
 
 		//NSLog(@"%d %d",(int)numFullBlks,(int)numQrtsBlks);
 
-        if(!_hideVolumeWindow)
-        {
-            if (@available(macOS 16.0, *)) {
-                // On Tahoe, show the new popover HUD anchored to the status item.
-                [[TahoeVolumeHUD sharedManager] showHUDWithVolume:volume usingMusicPlayer:runningPlayerPtr andLabel:[systemAudio getDefaultOutputDeviceName] anchoredToStatusButton:([self hideFromStatusBar] ? nil : self.statusBar.button)];
-            } else {
-                if(image) {
-                    id osdMgr = [self->OSDManager sharedManager];
-                    if (osdMgr) {
-                        [osdMgr showImage:image onDisplayID:CGSMainDisplayID() priority:OSDPriorityDefault msecUntilFade:1000 filledChiclets:(unsigned int)(round(((numFullBlks*4+numQrtsBlks)*1.5625)*100)) totalChiclets:(unsigned int)10000 locked:NO];
-                    }
+        if (@available(macOS 16.0, *)) {
+            [[TahoeVolumeHUD sharedManager] showHUDWithVolume:volume usingMusicPlayer:runningPlayerPtr andLabel:[systemAudio getDefaultOutputDeviceName]];
+        } else {
+            if(image) {
+                id osdMgr = [self->OSDManager sharedManager];
+                if (osdMgr) {
+                    [osdMgr showImage:image onDisplayID:CGSMainDisplayID() priority:OSDPriorityDefault msecUntilFade:1000 filledChiclets:(unsigned int)(round(((numFullBlks*4+numQrtsBlks)*1.5625)*100)) totalChiclets:(unsigned int)10000 locked:NO];
                 }
             }
         }
 
 #ifdef DEBUG
-        NSLog(@"[VC] step  internal=%.2f  →  target=%.2f  (HUD: %@)",
-              dbgPrevVolume,
-              volume,
-              _hideVolumeWindow ? @"hidden" : [NSString stringWithFormat:@"%.2f", volume]);
+        NSLog(@"[VC] step  internal=%.2f  →  target=%.2f", dbgPrevVolume, volume);
 #endif
 
-		[runningPlayerPtr setCurrentVolume:volume];
+        // Player mute restoration was already written above so it can bypass
+        // accidental-jump limiting while retaining the configured hard limit.
+        if (!restoredPlayerFromMute) {
+            [runningPlayerPtr setCurrentVolume:volume];
+        }
 		if (_LockSystemAndPlayerVolume && runningPlayerPtr != systemAudio) {
 			[systemAudio setCurrentVolume:volume];
 		}
-
-		if(self->volumeRampTimer == nil)
-			[self emitAcousticFeedback];
 
 		if( runningPlayerPtr == iTunes)
 			[self setItunesVolume:volume];
@@ -1613,68 +1559,22 @@ static NSString * const kGitHubIssuesURL = @"https://github.com/alberti42/Volume
 
 - (void) setItunesVolume:(NSInteger)volume
 {
-	if (volume == -1)
-		[[self iTunesPerc] setHidden:YES];
-	else
-	{
-		[[self iTunesPerc] setHidden:NO];
-		[[self iTunesPerc] setStringValue:[NSString stringWithFormat:@"(%d%%)",(int)volume]];
-	}
 }
 
 - (void) setSpotifyVolume:(NSInteger)volume
 {
-	if (volume == -1)
-		[[self spotifyPerc] setHidden:YES];
-	else
-	{
-		[[self spotifyPerc] setHidden:NO];
-		[[self spotifyPerc] setStringValue:[NSString stringWithFormat:@"(%d%%)",(int)volume]];
-	}
 }
 
 - (void) setDopplerVolume:(NSInteger)volume
 {
-	if (volume == -1)
-		[[self dopplerPerc] setHidden:YES];
-	else
-	{
-		[[self dopplerPerc] setHidden:NO];
-		[[self dopplerPerc] setStringValue:[NSString stringWithFormat:@"(%d%%)",(int)volume]];
-	}
 }
 
 - (void) setSwinsianVolume:(NSInteger)volume
 {
-	if (volume == -1)
-		[[self swinsianPerc] setHidden:YES];
-	else
-	{
-		[[self swinsianPerc] setHidden:NO];
-		[[self swinsianPerc] setStringValue:[NSString stringWithFormat:@"(%d%%)",(int)volume]];
-	}
 }
 
 - (void) setSystemVolume:(NSInteger)volume
 {
-	if (volume == -1)
-	{
-		[[self systemPerc] setHidden:YES];
-		return;
-	}
-
-	BOOL controllable = [systemAudio hasControllableVolume];
-
-	// Reflect availability in the System check mark: unchecked when the output
-	// device exposes no controllable volume, so the menu doesn't imply we can
-	// change a volume we can't. The item stays disabled either way.
-	[[self systemBtn] setState:controllable ? NSControlStateValueOn : NSControlStateValueOff];
-
-	[[self systemPerc] setHidden:NO];
-	if (controllable)
-		[[self systemPerc] setStringValue:[NSString stringWithFormat:@"(%d%%)",(int)volume]];
-	else
-		[[self systemPerc] setStringValue:@"(n/a)"];
 }
 
 - (void) updatePercentages
@@ -1752,176 +1652,10 @@ static NSString * const kGitHubIssuesURL = @"https://github.com/alberti42/Volume
 	[CATransaction commit];
 }
 
-
-#pragma mark - Hide From Status Bar
-
-- (IBAction)toggleHideFromStatusBar:(id)sender
-{
-	[self setHideFromStatusBar:![self hideFromStatusBar]];
-	if ([self hideFromStatusBar])
-		[self showHideFromStatusBarHintPopover];
-}
-
-- (void)setHideFromStatusBar:(bool)want_hide
-{
-	// NSLog(@"Will it hide: %d",want_hide);
-
-	_hideFromStatusBar=want_hide;
-
-	NSMenuItem* menuItem=[_statusMenu itemWithTag:HIDE_FROM_STATUS_BAR_ID];
-	[menuItem setState:[self hideFromStatusBar]];
-
-	[preferences setBool:want_hide forKey:@"hideFromStatusBarPreference"];
-	[preferences synchronize];
-    
-    if(want_hide){
-        // Pre-create the popover so it's ready when we need to show it
-        if (! _hideFromStatusBarHintPopover)
-        {
-            CGRect popoverRect = (CGRect) {
-                .size.width = 250,
-                .size.height = 63
-            };
-
-            _hideFromStatusBarHintLabel = [[NSTextField alloc] initWithFrame:CGRectInset(popoverRect, 10, 10)];
-            [_hideFromStatusBarHintLabel setFont:[NSFont systemFontOfSize:[NSFont smallSystemFontSize]]];
-            [_hideFromStatusBarHintLabel setEditable:false];
-            [_hideFromStatusBarHintLabel setSelectable:false];
-            [_hideFromStatusBarHintLabel setBezeled:false];
-            [_hideFromStatusBarHintLabel setBackgroundColor:[NSColor clearColor]];
-            [_hideFromStatusBarHintLabel setAlignment:NSTextAlignmentCenter];
-
-            _hintView = [[NSView alloc] initWithFrame:popoverRect];
-            [_hintView addSubview:_hideFromStatusBarHintLabel];
-
-            _hintVC = [[NSViewController alloc] init];
-            [_hintVC setView:_hintView];
-
-            _hideFromStatusBarHintPopover = [[NSPopover alloc] init];
-            [_hideFromStatusBarHintPopover setContentViewController:_hintVC];
-        }
-    }
-
-	if(want_hide && self.statusBar.isVisible)
-	{
-		if (![_statusBarHideTimer isValid] )
-		{
-			// NSLog(@"Start new timers");
-			[self setHideFromStatusBarHintLabelWithSeconds:statusBarHideDelay];
-			_statusBarHideTimer = [NSTimer timerWithTimeInterval:statusBarHideDelay target:self selector:@selector(doHideFromStatusBar:) userInfo:nil repeats:NO];
-			[[NSRunLoop mainRunLoop] addTimer:_statusBarHideTimer forMode:NSRunLoopCommonModes];
-			_hideFromStatusBarHintPopoverUpdateTimer = [NSTimer timerWithTimeInterval:0.1 target:self selector:@selector(updateHideFromStatusBarHintPopover:) userInfo:nil repeats:YES];
-			[[NSRunLoop mainRunLoop] addTimer:_hideFromStatusBarHintPopoverUpdateTimer forMode:NSRunLoopCommonModes];
-		}
-	}
-	else
-	{
-		// NSLog(@"INVALIDATE TIMERS");
-		[_hideFromStatusBarHintPopover close];
-		[_statusBarHideTimer invalidate];
-		_statusBarHideTimer = nil;
-		[_hideFromStatusBarHintPopoverUpdateTimer invalidate];
-		_hideFromStatusBarHintPopoverUpdateTimer = nil;
-	}
-}
-
--(void)hideStatusBarItem {
-	if (self.statusBar) {
-		self.statusBar.visible = NO;
-		// Force the underlying NSStatusBarWindow out of visibility too. Setting
-		// visible=NO alone removes the item from the menu bar composite but leaves
-		// button.window.isVisible == YES, which would otherwise mislead anchoring
-		// code (e.g. the Tahoe HUD) into using a stale cached frame.
-		[self.statusBar.button.window orderOut:nil];
-		// self.statusBar.length = 0; // collapses to zero width, however, some space remains allocated by macOS
-	}
-}
-
-- (void)showStatusBarItem {
-	if (self.statusBar) {
-		self.statusBar.visible = YES;
-		[self.statusBar.button.window orderFront:nil];
-		// self.statusBar.length = NSSquareStatusItemLength;
-	}
-}
-
-- (void)doHideFromStatusBar:(NSTimer*)aTimer
-{
-	// NSLog(@"doHideFromStatusBar");
-	[_hideFromStatusBarHintPopoverUpdateTimer invalidate];
-	_hideFromStatusBarHintPopoverUpdateTimer = nil;
-
-	[_statusBarHideTimer invalidate];
-	_statusBarHideTimer = nil;
-
-	[_hideFromStatusBarHintPopover close];
-	[self hideStatusBarItem];
-	[self setHideFromStatusBar:true];
-}
-
-- (void)showHideFromStatusBarHintPopover
-{
-	if ([_hideFromStatusBarHintPopover isShown]) return;
-
-	// NSLog(@"Will show popover");
-
-	NSStatusBarButton *statusBarButton = [[self statusBar] button];
-	[_hideFromStatusBarHintPopover showRelativeToRect:[statusBarButton bounds] ofView:statusBarButton preferredEdge:NSMinYEdge];
-}
-
-- (void)updateHideFromStatusBarHintPopover:(NSTimer*)aTimer
-{
-	NSDate *now = [NSDate date];
-	NSTimeInterval remaining = [[_statusBarHideTimer fireDate] timeIntervalSinceDate:now];
-	NSUInteger rounded = (NSUInteger)ceil(remaining);
-	[self setHideFromStatusBarHintLabelWithSeconds:rounded];
-	// NSLog(@"Timer remaining: %lu s", (unsigned long)rounded);
-}
-
-- (void)setHideFromStatusBarHintLabelWithSeconds:(NSUInteger)seconds
-{
-	[_hideFromStatusBarHintLabel setStringValue:[NSString stringWithFormat:@"Volume Control will hide after %ld seconds. Launch the app again to make the icon reappear in the menu bar.",seconds]];
-}
-
 #pragma mark - Music players
 
 - (IBAction)toggleMusicPlayer:(id)sender
 {
-	if (sender == _iTunesBtn) {
-		[preferences setBool:[sender state] forKey:@"iTunesControl"];
-	}
-	else if (sender == _spotifyBtn)
-	{
-		[preferences setBool:[sender state] forKey:@"spotifyControl"];
-	}
-	else if (sender == _dopplerBtn)
-	{
-		[preferences setBool:[sender state] forKey:@"dopplerControl"];
-	}
-	else if (sender == _swinsianBtn)
-	{
-		[preferences setBool:[sender state] forKey:@"swinsianControl"];
-	}
-
-	[preferences synchronize];
-}
-
-#pragma mark - NSMenuDelegate
-
-- (IBAction)toggleHideVolumeWindow:(id)sender
-{
-	[self setHideVolumeWindow:![self hideVolumeWindow]];
-}
-
-- (void)setHideVolumeWindow:(bool)enabled
-{
-	_hideVolumeWindow=enabled;
-
-	NSMenuItem* menuItem=[_statusMenu itemWithTag:HIDE_VOLUME_WINDOW_ID];
-	[menuItem setState:[self hideVolumeWindow]];
-
-	[preferences setBool:enabled forKey:@"hideVolumeWindowPreference"];
-	[preferences synchronize];
 }
 
 - (void)menuWillOpen:(NSMenu *)menu
@@ -1934,17 +1668,12 @@ static NSString * const kGitHubIssuesURL = @"https://github.com/alberti42/Volume
 		[[NSRunLoop mainRunLoop] addTimer:updateSystemVolumeTimer forMode:NSRunLoopCommonModes];
 	}
 
-	[_hideFromStatusBarHintPopover close];
 	menuIsVisible=true;
 }
 
 - (void)menuDidClose:(NSMenu *)menu
 {
 	menuIsVisible=false;
-	if([[self statusBar] isVisible] && [self hideFromStatusBar])
-	{
-		[self showHideFromStatusBarHintPopover];
-	}
 
 	// Remove timer used to update volume bar status in the menu bar
 	if(updateSystemVolumeTimer)
@@ -1967,6 +1696,10 @@ static NSString * const kGitHubIssuesURL = @"https://github.com/alberti42/Volume
     id runningPlayerPtr = controlledPlayer;
     
     if (runningPlayerPtr != nil) {
+        if ([runningPlayerPtr isKindOfClass:[PlayerApplication class]]) {
+            volumePercent = [(PlayerApplication *)runningPlayerPtr
+                             protectedVolumeForRequestedVolume:volumePercent];
+        }
         // 3. Set the volume for the active player.
         [runningPlayerPtr setCurrentVolume:volumePercent];
         
@@ -1990,20 +1723,6 @@ static NSString * const kGitHubIssuesURL = @"https://github.com/alberti42/Volume
             [self setSystemVolume:volumePercent];
         }
     }
-}
-
-- (void)didChangeVolumeFinal:(TahoeVolumeHUD *)hud {
-    // This is called when the HUD fades out. We can play the feedback sound here
-    [self emitAcousticFeedback];
-}
-
-
-#pragma mark - Sparkle Delegates
-
-// This is the Objective-C equivalent of the Swift property 'supportsGentleScheduledUpdateReminders'
-// This is the correct way to opt-in and remove the warning.
-- (BOOL)supportsGentleScheduledUpdateReminders {
-	return YES;
 }
 
 @end

@@ -3,24 +3,23 @@
 //  iTunes Volume Control
 //
 //  Created by Andrea Alberti on 25.12.12.
-//  Copyright (c) 2012 Andrea Alberti. All rights reserved.
+//  Copyright (c) 2012 Andrea Alberti and contributors.
+//  Modified in 2026 by Luca Leukert.
+//  SPDX-License-Identifier: GPL-3.0-only
 //
 
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/CoreAnimation.h>
 
-#import <Sparkle/Sparkle.h>
-
-#import "TahoeVolumeHUD.h"
 #import "iTunes.h"
 // #import "Music.h"
 #import "Spotify.h"
 #import "Doppler.h"
 #import "Swinsian.h"
 
-@class IntroWindowController, AccessibilityDialog, StatusBarItem, PlayerApplication, SystemApplication;
+@class IntroWindowController, StatusBarItem, PlayerApplication, SystemApplication;
 
-@interface AppDelegate : NSObject <NSApplicationDelegate, NSMenuItemValidation, SPUUpdaterDelegate, SPUStandardUserDriverDelegate, TahoeVolumeHUDDelegate> {
+@interface AppDelegate : NSObject <NSApplicationDelegate, NSMenuItemValidation> {
     CALayer *volumeImageLayer;
     CALayer *volumeBar[16];
     
@@ -46,8 +45,6 @@
     
     Class OSDManager;
     
-    NSSound* volumeSound;
-    
 @public
     PlayerApplication* iTunes;
     PlayerApplication* spotify;
@@ -56,52 +53,28 @@
     PlayerApplication* swinsian;
 
     IntroWindowController *introWindowController;
-    AccessibilityDialog *accessibilityDialog;
 }
-
-@property (nonatomic, assign) IBOutlet NSMenu* statusMenu;
-@property (nonatomic, assign) IBOutlet NSSliderCell* volumeIncrementsSlider;
-
-@property (nonatomic, assign) IBOutlet NSButton* iTunesBtn;
-@property (nonatomic, assign) IBOutlet NSButton* spotifyBtn;
-@property (nonatomic, assign) IBOutlet NSButton* systemBtn;
-@property (nonatomic, assign) IBOutlet NSButton* dopplerBtn;
-@property (nonatomic, assign) IBOutlet NSButton* swinsianBtn;
-
-@property (nonatomic, assign) IBOutlet NSTextField* iTunesPerc;
-@property (nonatomic, assign) IBOutlet NSTextField* spotifyPerc;
-@property (nonatomic, assign) IBOutlet NSTextField* systemPerc;
-@property (nonatomic, assign) IBOutlet NSTextField* dopplerPerc;
-@property (nonatomic, assign) IBOutlet NSTextField* swinsianPerc;
-
-@property (assign, nonatomic) IBOutlet SPUStandardUpdaterController* sparkle_updater;
 
 @property (nonatomic, strong) NSStatusItem *statusBar;
 
 @property (assign, nonatomic) NSInteger volumeInc;
 @property (assign, nonatomic) bool AppleRemoteConnected;
 @property (assign, nonatomic) bool StartAtLogin;
-@property (assign, nonatomic) bool PlaySoundFeedback;
 @property (assign, nonatomic) bool Tapping;
 @property (assign, nonatomic) bool UseAppleCMDModifier;
 @property (assign, nonatomic) bool LockSystemAndPlayerVolume;
 @property (assign, nonatomic) bool AppleCMDModifierPressed;
-@property (assign, nonatomic) bool AutomaticUpdates;
-@property (assign, nonatomic) bool hideFromStatusBar;
-@property (assign, nonatomic) bool hideVolumeWindow;
 @property (assign, nonatomic) bool loadIntroAtStart;
 
 - (IBAction)toggleUseAppleCMDModifier:(id)sender;
 - (IBAction)toggleLockSystemAndPlayerVolume:(id)sender;
-- (IBAction)toggleAutomaticUpdates:(id)sender;
-- (IBAction)toggleHideFromStatusBar:(id)sender;
-- (IBAction)toggleHideVolumeWindow:(id)sender;
 - (IBAction)toggleStartAtLogin:(id)sender;
-- (IBAction)togglePlaySoundFeedback:(id)sender;
 - (IBAction)toggleTapping:(id)sender;
 - (IBAction)aboutPanel:(id)sender;
 - (IBAction)copyDiagnostics:(id)sender;
-- (IBAction)sliderValueChanged:(NSSliderCell*)slider;
+- (void)updateVolumeIncrement:(NSInteger)value;
+- (void)updateVolumeIncrementNumber:(NSNumber *)value;
+- (void)applyVolumeLimitForPreference:(NSString *)preference;
 //- (IBAction)showIntroWindow:(id)sender;
 - (IBAction)terminate:(id)sender;
 - (BOOL)tryCreateEventTap;
@@ -127,6 +100,11 @@
 @property (assign, nonatomic) double currentVolume;
 @property (assign, nonatomic) double oldVolume;
 @property (assign, nonatomic) double doubleVolume;
-@property (assign, nonatomic) NSImage* icon;
+@property (strong, nonatomic) NSImage* icon;
+@property (copy, nonatomic, readonly) NSString* bundleIdentifier;
+
+- (double)protectedVolumeForRequestedVolume:(double)requestedVolume;
+- (double)maximumAllowedVolume;
+- (double)restoreVolumeAfterMute:(double)requestedVolume;
 
 @end
