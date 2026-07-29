@@ -3,6 +3,9 @@
 //  VolumeControlHelper
 //
 //  Created by Andrea Alberti on 27.09.25.
+//  Copyright (c) 2025 Andrea Alberti and contributors.
+//  Modified in 2026 by Luca Leukert.
+//  SPDX-License-Identifier: GPL-3.0-only
 //
 
 @import Cocoa;

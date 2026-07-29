@@ -20,24 +20,16 @@
 	<string>public.app-category.utilities</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
+	<key>LSMultipleInstancesProhibited</key>
+	<true/>
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSAppleEventsUsageDescription</key>
 	<string>Volume Control needs to communicate with Music, Spotify, and Doppler to control their volume.</string>
 	<key>NSHumanReadableCopyright</key>
-	<string>Copyright © 2012 Andrea Alberti. All rights reserved.</string>
-	<key>NSMainNibFile</key>
-	<string>MainMenu</string>
+	<string>Original work © 2012–2026 Andrea Alberti and contributors. Fork modifications © 2026 Luca Leukert.</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
-	<key>SUFeedURL</key>
-	<string>https://raw.githubusercontent.com/alberti42/Volume-Control/main/Releases/VolumeControlCast.xml</string>
-	<key>SUExpectsDSASignature</key>
-	<true/>
-	<key>SUPublicDSAKeyFile</key>
-	<string>dsa_pub.pem</string>
-	<key>SUPublicEDKey</key>
-	<string>/Qr5lrMfJsU5UPvmXC7VnT4jHdTza3c663lSbA+4O94=</string>
 	<key>CFBundleLocalizations</key>
 	<array>
 		<string>en</string>
