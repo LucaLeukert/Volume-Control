@@ -1,0 +1,32 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Create non-secret CI build configuration
+        run: cp LocalSigning.xcconfig.example LocalSigning.xcconfig
+
+      - name: Build
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project "Volume Control.xcodeproj" \
+            -scheme "Volume Control" \
+            -configuration Debug \
+            -destination "platform=macOS,arch=arm64" \
+            CODE_SIGNING_ALLOWED=NO \
+            build

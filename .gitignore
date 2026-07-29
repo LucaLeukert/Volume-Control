@@ -9,14 +9,15 @@ build.nosync/*
 # Exclude OS X folder attributes
 .DS_Store
  
-# Exclude user-specific XCode 3 and 4 files
+# Exclude user-specific Xcode files
 *.mode1
 *.mode1v3
 *.mode2v3
 *.perspective
 *.perspectivev3
 *.pbxuser
-xcuserdata
+xcuserdata/
+*.xcuserstate
 
 OSDUIHelper.hop
 readme.txt
@@ -29,3 +30,5 @@ Releases/appcast.xml
 LocalSigning.xcconfig
 
 compile_commands*.json
+*.xcarchive
+.swiftpm/

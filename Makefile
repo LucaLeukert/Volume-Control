@@ -10,7 +10,8 @@ PROJECT   := Volume Control.xcodeproj
 SCHEME    := Volume Control
 
 .PHONY: debug-arm64 debug-x86_64 release \
-        clean-arm64 clean-x86_64 run generate-db
+        clean-arm64 clean-x86_64 run run-x86_64 \
+        generate-db-arm64 generate-db-x86_64
 
 Q ?= @   # quiet by default; override with `make Q=`
 
@@ -23,7 +24,7 @@ debug-arm64:
 	    -destination "${DESTINATION_ARM64}" \
 	    BUILD_DIR="$(BUILD_DIR)/debug" \
 	    CONFIGURATION_BUILD_DIR="$(CONFIGURATION_BUILD_DIR)/debug" \
-	    build | xcpretty
+	    build
 
 # Debug build for x86_64
 debug-x86_64:
@@ -34,7 +35,7 @@ debug-x86_64:
 	    -destination "${DESTINATION_X86_64}" \
 	    BUILD_DIR="$(BUILD_DIR)/debug" \
 	    CONFIGURATION_BUILD_DIR="$(CONFIGURATION_BUILD_DIR)/debug" \
-	    build | xcpretty
+	    build
 
 # Release build for distribution (both archs)
 release:
@@ -46,7 +47,7 @@ release:
 	    ONLY_ACTIVE_ARCH=NO \
 	    BUILD_DIR="$(BUILD_DIR)/release" \
 	    CONFIGURATION_BUILD_DIR="$(CONFIGURATION_BUILD_DIR)/release" \
-	    build | xcpretty
+	    build
 
 # Clean targets
 clean-arm64:
@@ -57,27 +58,35 @@ clean-arm64:
 	    -destination "${DESTINATION_ARM64}" \
 	    BUILD_DIR="$(BUILD_DIR)/debug" \
 	    CONFIGURATION_BUILD_DIR="$(CONFIGURATION_BUILD_DIR)/debug" \
-	    clean | xcpretty
+	    clean
 
 clean-x86_64:
 	$(Q)xcrun xcodebuild \
 	    -project "$(PROJECT)" \
 	    -scheme "$(SCHEME)" \
 	    -configuration Debug \
-	    -destination "${DESTINATION_ARM64}" \
+	    -destination "${DESTINATION_X86_64}" \
 	    BUILD_DIR="$(BUILD_DIR)/debug" \
 	    CONFIGURATION_BUILD_DIR="$(CONFIGURATION_BUILD_DIR)/debug" \
-	    clean | xcpretty
+	    clean
 
-# Run the app (after debug build)
-run:
-	$(Q)open "$(CONFIGURATION_BUILD_DIR)/debug/Volume Control.app"
-	command log stream --process "Volume Control" --predicate 'eventMessage CONTAINS "[DEBUG]"'
-run:
+# Build and run the native Apple Silicon Debug app.
+run: debug-arm64
 	$(Q)killall -15 "Volume Control" 2>/dev/null || true
-	$(Q)open "$(CONFIGURATION_BUILD_DIR)/debug/Volume Control.app"
-	echo "Waiting for logs from Volume Control..."
-	$(Q)command log stream --process "Volume Control"
+	$(Q)for attempt in $$(seq 1 50); do \
+	    pgrep -x "Volume Control" >/dev/null || break; \
+	    sleep 0.1; \
+	done
+	$(Q)open -n "$(CONFIGURATION_BUILD_DIR)/debug/Volume Control.app"
+
+# Build and run the Intel Debug app.
+run-x86_64: debug-x86_64
+	$(Q)killall -15 "Volume Control" 2>/dev/null || true
+	$(Q)for attempt in $$(seq 1 50); do \
+	    pgrep -x "Volume Control" >/dev/null || break; \
+	    sleep 0.1; \
+	done
+	$(Q)open -n "$(CONFIGURATION_BUILD_DIR)/debug/Volume Control.app"
 
 # Generate compile_commands.json for LSP-clangd server
 generate-db-x86_64:
